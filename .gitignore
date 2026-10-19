@@ -1,0 +1,36 @@
+build/
+build-cmake/
+*.o
+*.exe
+*.dll
+*.sys
+tools/__pycache__/
+*.user
+.qmake.stash
+Makefile
+Makefile.*
+
+# Installer output. The .iss reads build/release and writes here; neither belongs in git.
+dist/
+
+# Screenshots and rendered frames produced while checking layout. Useful to look at,
+# never part of the source, and large.
+*.png
+!src/*.png
+!docs/*.png
+!docs/screenshots/*.png
+!reference/**/*.png
+
+# One-off working scripts. The shell and Python helpers used to inspect or patch the
+# sources during development are specific to one machine and are not tools the project
+# ships; the tracked test suite lives in tools/*.cpp.
+tools/*.py
+!tools/analyse_shot.py
+!tools/repair_literals.py
+!tools/update_readme_*.py
+
+# Editor and OS leftovers.
+*.swp
+*.bak
+Thumbs.db
+desktop.ini

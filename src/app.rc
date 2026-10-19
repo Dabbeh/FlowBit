@@ -1,0 +1,17 @@
+#include <windows.h>
+
+/* Flowbit application icon: the "Flowing F" mark (two flowing ribbon paths),
+   embedded at 7 sizes (16..256) so Windows picks a native rendering for the
+   taskbar, tray, Start Menu and Alt-Tab rather than scaling one bitmap.
+   Regenerate with tools\build_icons.ps1 from docs\flowbit-dark.svg.
+
+   The identifier is IDI_ICON1 (ordinal 1) DELIBERATELY, not a descriptive name.
+   The Windows shell looks for an executable's icon at the LOWEST ORDINAL
+   resource id when it builds a Start menu entry or a pinned shortcut. A *named*
+   resource (the previous "IDI_FLOWBIT_ICON") is not found by that lookup, which
+   is why the icon appeared in Explorer - which also tries other methods - but
+   not in the Start menu. */
+IDI_ICON1 ICON "flowbit.ico"
+
+/* UAC: requireAdministrator + DPI awareness */
+1 24 "flowbit.manifest"
