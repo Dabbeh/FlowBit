@@ -225,16 +225,17 @@ int main(int argc, char *argv[])
         for (const DiagnosticItem &i : report.items) {
             if (i.name != QLatin1String("Start type"))
                 continue;
-            if (i.detail.contains(QStringLiteral("repairs it automatically"))
-                || i.detail.contains(QStringLiteral("repairs this automatically")))
+            // WinDivert registers its service with a disabled start type and loads the
+            // driver itself, so when the driver is loaded the report must say nothing needs
+            // doing - not that a repair happens later, and not that the user must act.
+            if (i.detail.contains(QStringLiteral("Nothing is wrong here")))
                 explainsRepair = true;
             if (i.detail.contains(QStringLiteral("sc config WinDivert start= demand")))
                 hasManualFix = true;
         }
 
         check(explainsRepair,
-              "the report says the repair is automatic, rather than implying the user must "
-              "act");
+              "the report says nothing needs doing, rather than implying the user must act");
 
         // Whether the command is offered follows the driver's state, which is reported in
         // its own row. Read that rather than assuming, so the test states the rule instead

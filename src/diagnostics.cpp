@@ -427,18 +427,17 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
         add(QStringLiteral("Driver service"), QStringLiteral("Start type"),
             describeStartType(svc.startType),
             blocked ? DiagnosticItem::Status::Problem
-                    : (disabled ? DiagnosticItem::Status::Warning
+                    : (disabled ? DiagnosticItem::Status::Info
                                 : DiagnosticItem::Status::Ok),
             disabled ? (loaded
                             ? QStringLiteral(
-                                  "The service is registered but set not to start. The "
-                                  "driver is loaded and working now, so limits apply - "
-                                  "but after a restart Windows will refuse to load it "
-                                  "until the start type is restored.\n\n"
-                                  "This is what an update leaves behind, because Windows "
-                                  "disables a kernel service whose driver file is "
-                                  "replaced underneath it. Flowbit repairs it "
-                                  "automatically the next time a limit is applied.")
+                                  "WinDivert registers its own driver service with a disabled start type "
+                                    "and loads the driver through its own installer, not through "
+                                    "Windows' service starter - which is why the driver runs "
+                                    "while the service reads DISABLED.\n\n"
+                                    "Nothing is wrong here: the driver is loaded and limits "
+                                    "apply. The value is reported because it is surprising, "
+                                    "not because it needs changing.")
                             : QStringLiteral(
                                   "The service is set not to start and the driver is not "
                                   "loaded, so limits cannot be applied. This is what an "

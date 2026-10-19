@@ -304,6 +304,21 @@ RepairOutcome repairDisabledDriverService()
             return RepairOutcome::Refused;
         }
 
+        // Nothing is stopped while the driver is loaded.
+        //
+        // Stopping was meant to complete a pending deletion. In practice it interrupted shaping
+        // for every application mid-session, and a pending deletion completes the moment the last
+        // handle closes - so the stop was the one thing that could make a DeleteFlag take effect
+        // at an arbitrary time. WinDivert reloads the driver on the next open, producing another
+        // "service was installed" event and potentially another pending delete.
+        //
+        // A loaded driver is a working driver: nothing to repair.
+        if (readDriverServiceState().running) {
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return RepairOutcome::Repaired;
+        }
+
         // Step 2: bring the loaded driver out of kernel memory.
         //
         // THIS IS WHAT COMPLETES THE PENDING DELETION, and it is why a restart is not needed.
