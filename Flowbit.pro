@@ -49,7 +49,7 @@ WINDIVERT_ROOT = $$PWD/third_party/WinDivert/WinDivert-2.2.2-A
 WINDIVERT_ARCH = $$WINDIVERT_ROOT/x64
 
 INCLUDEPATH += $$WINDIVERT_ROOT/include
-LIBS += -L$$WINDIVERT_ARCH -lwindivert
+LIBS += -L$$WINDIVERT_ARCH -lwindivert -lwinmm
 LIBS += -liphlpapi -lws2_32 -lshell32 -luser32
 # ETW session management and payload decoding for per-application monitoring.
 LIBS += -ladvapi32 -ltdh

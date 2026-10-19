@@ -14,6 +14,10 @@
 #include <QScrollBar>
 #include <QLabel>
 #include <QParallelAnimationGroup>
+#include <QLayout>
+
+#include <windows.h>
+#include <mmsystem.h>
 #include <QPropertyAnimation>
 #include <QPushButton>
 #include <QSet>
@@ -55,7 +59,11 @@ QTableWidgetItem *makeItem(const QString &text, Qt::Alignment align)
 // 280ms is the reveal: InOutSine starts at zero velocity, so a shorter duration reads as a
 // hesitation before the panel moves at all. The settle is deliberately much shorter - it is
 // a correction, not a second movement, and anything longer would read as two motions.
-constexpr int kRevealMs = 280;
+// 340ms rather than 280ms: the reveal has to travel ~190-500px depending on row count, and
+// at 280ms the fastest frames stepped 17px each - measured - which reads as chunky rather
+// than smooth. A longer duration does not change the curve's shape, only how many frames
+// share the distance.
+constexpr int kRevealMs = 340;
 constexpr int kSettleMs = 140;
 } // namespace
 
@@ -287,6 +295,8 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     m_expandAnim->setEasingCurve(QEasingCurve::InOutSine);
 
     connect(m_expandAnim, &QVariantAnimation::finished, this, [this] {
+        // This tween is over; a settle below re-acquires it.
+        endPreciseTiming();
         if (!m_expanded) {
             // Fully collapsed: hide, and release the height constraint so the
             // widget is never left pinned if it is shown again.
@@ -320,7 +330,12 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
         // for the tween was measured against the empty state, which is why the first
         // open could settle at the wrong height.
         m_animating = false;
-        refresh();
+
+        // No rebuild here. The content was filled BEFORE the tween started, so the rows are
+        // already current; rebuilding again on the last frame put the whole cost of formatting
+        // every cell into the same frame that draws the end of the motion - measured as 21ms and
+        // 29ms frames at the very end of the reveal, which is exactly where the eye notices a
+        // hitch.
         if (m_animHeight >= 0 && m_expanded) {
             const int want = qMax(120, sizeHint().height());
             const int delta = qAbs(want - m_animHeight);
@@ -337,7 +352,9 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
                 m_expandAnim->setEasingCurve(QEasingCurve::OutCubic);
                 m_expandAnim->setStartValue(m_animHeight);
                 m_expandAnim->setEndValue(want);
-                m_expandAnim->start();
+                beginPreciseTiming();
+            beginPreciseTiming();
+        m_expandAnim->start();
                 return;   // finished() runs again when the settle completes
             }
             if (want != m_animHeight)
@@ -346,6 +363,10 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
         // The tween reached completion: the scroll range is now final, so this is
         // the first moment a viewport glide can be computed correctly.
         emit revealFinished();
+
+        // Catch up on anything that arrived during the tween, on the next event-loop turn so the
+        // final frame is drawn first.
+        QTimer::singleShot(0, this, [this] { refresh(); });
     });
 
     // Ranking refresh, deliberately slower than the value refresh.
@@ -355,12 +376,30 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
         // Expanded AND on screen. The timer used to rebuild the table while the panel was
         // collapsed out of sight or while another page was showing, which cost a re-sort and a
         // full row rebuild every three seconds for output nobody could see.
-        if (m_expanded && isVisible())
+        if (m_expanded && isVisible() && !m_animating)
             refresh();
     });
     m_rankTimer->start();
 
     setVisible(false);
+}
+
+void AppActivityPanel::beginPreciseTiming()
+{
+    // Windows wakes a thread on a 15.6ms grid unless asked otherwise, and Qt's animation driver
+    // has no finer source. Measured with the reveal instrumented: gaps of 17ms alternating with
+    // 30ms - the animation is not slow, it is being handed every other tick.
+    //
+    // The animation test harness had always called timeBeginPeriod(1) itself, which is why the
+    // reveal measured smooth in the suite and rough in the application.
+    if (m_preciseTimers++ == 0)
+        timeBeginPeriod(1);
+}
+
+void AppActivityPanel::endPreciseTiming()
+{
+    if (m_preciseTimers > 0 && --m_preciseTimers == 0)
+        timeEndPeriod(1);
 }
 
 void AppActivityPanel::setAnimHeight(int height)
@@ -430,6 +469,12 @@ void AppActivityPanel::setExpanded(bool expanded)
             updateStateVisibility();
             refresh();
 
+            // Settle the geometry the prefill just created BEFORE the tween starts. Otherwise the
+            // first animated frame is also the frame that lays out and positions every row, and
+            // that frame was the 30ms one.
+            if (QLayout *panelLayout = layout())
+                panelLayout->activate();
+
             const int target = qMax<int>(120, sizeHint().height());
 
             m_expandAnim->stop();
@@ -441,7 +486,9 @@ void AppActivityPanel::setExpanded(bool expanded)
             // correct, then animate outwards.
             setAnimHeight(1);
 
-            m_expandAnim->start();
+            beginPreciseTiming();
+            beginPreciseTiming();
+        m_expandAnim->start();
         } else {
             setAnimHeight(-1);
         }
@@ -485,7 +532,9 @@ void AppActivityPanel::setExpanded(bool expanded)
             m_expandAnim->stop();
             m_expandAnim->setStartValue(qMax(1, height()));
             m_expandAnim->setEndValue(1);
-            m_expandAnim->start();
+            beginPreciseTiming();
+            beginPreciseTiming();
+        m_expandAnim->start();
         } else {
             setVisible(false);
             setAnimHeight(-1);

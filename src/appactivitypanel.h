@@ -51,6 +51,13 @@ public:
     void setAnimHeight(int height);
 
     bool isExpanded() const { return m_expanded; }
+
+    // True while a reveal or collapse tween is in flight.
+    //
+    // Measured reason this is public: the periodic refresh rebuilt every row during the reveal,
+    // and those rebuilds were the 20-30ms frame stalls - the reveal's own layout cost was one
+    // resize for the whole motion. A caller that is about to do that work can ask first.
+    bool isAnimating() const { return m_animating; }
     void setExpanded(bool expanded);
 
     // Drives the panel from the monitor. Called once per monitor interval while
@@ -177,6 +184,16 @@ private:
     // True while a reveal or collapse is in flight; the table rebuild is
     // skipped during this so frames are not spent rebuilding rows.
     bool m_animating = false;
+
+    // How many tweens currently hold a 1ms system timer resolution.
+    //
+    // Windows schedules timers on a 15.6ms grid by default, so a ~60fps animation lands on
+    // alternate ticks: measured frame gaps of 17ms alternating with 30ms. Requesting 1ms while a
+    // tween runs is what turns that into even frames. Balanced, because releasing it early (or
+    // twice) either leaves the resolution raised system-wide or breaks the next tween.
+    int m_preciseTimers = 0;
+    void beginPreciseTiming();
+    void endPreciseTiming();
     int m_maxHeight = QWIDGETSIZE_MAX;
     bool m_animated = true;
 

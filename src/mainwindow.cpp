@@ -175,13 +175,19 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
         // this driver the ingested bytes never became a finished snapshot.
         // The monitor tick must keep running: it is what turns ingested bytes into finished
         // intervals, and the usage totals depend on it whether or not anything is on screen.
-        if (m_appMonitor && m_appMonitor->isRunning())
+        // Skipped for the ~300ms a tween runs: tick() formats and sorts every application, and
+        // doing that between two animation frames is what the measured 20-30ms stalls were.
+        // Nothing is lost by waiting - ingest() keeps accumulating under its own lock, and the
+        // next tick finalises the same interval.
+        const bool tweenRunning = m_appPanel && m_appPanel->isAnimating();
+        if (!tweenRunning && m_appMonitor && m_appMonitor->isRunning())
             m_appMonitor->tick();
 
         // The panel refresh is pure presentation - it re-sorts, re-formats and rebuilds rows.
         // Doing that while Flowbit sits in the tray, or while another page is showing, was work
         // whose only result was thrown away on the next tick.
-        if (m_appPanel && m_appPanel->isExpanded() && m_appPanel->isVisible())
+        if (m_appPanel && m_appPanel->isExpanded() && m_appPanel->isVisible()
+            && !m_appPanel->isAnimating())
             m_appPanel->refresh();
     });
     m_appRefreshTimer->start();
