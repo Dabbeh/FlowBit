@@ -13,6 +13,7 @@
 #include <QNetworkRequest>
 #include <QProcess>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -151,18 +152,44 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
 
     // The offer comes before any download, so nothing is transferred without consent -
     // including on a metered connection, where several megabytes is not a trivial cost.
-    QString message = QStringLiteral("Flowbit %1 is available. You have %2.\n\n"
-                                     "Download and install it now? Flowbit will restart "
-                                     "to finish.")
-                          .arg(version, currentVersion());
+    // Three answers, because two always lose one of them.
+    //
+    // "No" used to mean two different things at once - not now, and never again - so a user who
+    // wanted to defer had to either accept the download immediately or be asked again on the next
+    // check with no way to say "not this time but keep telling me". Each answer now has its own
+    // button and its own consequence:
+    //
+    //   Update now         download and swap in
+    //   Later              ask again on the next check, in this session or the next launch
+    //   Skip this version  stop offering THIS version; a newer one is offered normally
+    QMessageBox box(m_ui);
+    box.setWindowTitle(QStringLiteral("Update available"));
+    box.setIcon(QMessageBox::Information);
+    box.setText(QStringLiteral("Flowbit %1 is available. You have %2.")
+                    .arg(version, currentVersion()));
     if (!notes.isEmpty())
-        message += QStringLiteral("\n\n%1").arg(notes);
+        box.setInformativeText(notes);
+    box.setStandardButtons(QMessageBox::NoButton);
 
-    const int answer = QMessageBox::question(
-        m_ui, QStringLiteral("Update available"), message,
-        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
-    if (answer != QMessageBox::Yes)
+    QPushButton *nowButton = box.addButton(QStringLiteral("Update now"), QMessageBox::AcceptRole);
+    QPushButton *laterButton = box.addButton(QStringLiteral("Later"), QMessageBox::RejectRole);
+    QPushButton *skipButton =
+        box.addButton(QStringLiteral("Skip this version"), QMessageBox::DestructiveRole);
+    box.setDefaultButton(nowButton);
+    box.setEscapeButton(laterButton);
+    box.exec();
+
+    if (box.clickedButton() == skipButton) {
+        emit updateSkipped(version);
         return;
+    }
+    if (box.clickedButton() != nowButton) {
+        // Later, or the window closed - both mean "not now". Closing the dialog is treated as
+        // deferral rather than as a decision to skip: a stray Escape must not silence an update
+        // for good.
+        emit updateDeferred(version);
+        return;
+    }
 
     // Written beside the running executable, because that is where the swap has to happen
     // and it avoids needing to know where a temporary directory is writable.

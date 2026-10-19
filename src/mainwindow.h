@@ -355,6 +355,13 @@ private:
     //
     // Bounded. If the state does not clear it will not clear by waiting, and an unbounded poll
     // would be a background loop doing nothing for the life of the session.
+    // Re-offers a postponed update later in the same session. One timer, restarted on each
+    // deferral, so repeated "Later" clicks cannot queue several prompts.
+    QTimer *m_updateSnooze = nullptr;
+
+    // How long a postponed update waits before it is mentioned again.
+    static constexpr int kUpdateSnoozeMs = 30 * 60 * 1000;
+
     QTimer *m_driverRetry = nullptr;
     int m_driverAttempts = 0;
 

@@ -74,6 +74,13 @@ public:
 
 signals:
     void updateAvailable(const QString &version, const QString &url, const QString &notes);
+
+    // The user asked to be reminded later, or to stop being offered this version.
+    //
+    // Separate signals rather than a return value because the offer is shown from a dialog the
+    // caller does not manage: the choice has to travel to whoever owns the settings.
+    void updateDeferred(const QString &version);
+    void updateSkipped(const QString &version);
     void upToDate(const QString &version);
     void failed(const QString &reason);
 

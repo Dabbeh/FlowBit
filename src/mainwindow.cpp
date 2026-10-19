@@ -3813,10 +3813,51 @@ void MainWindow::checkForUpdatesNow(bool announce)
             [this, once, restore](const QString &version, const QString &url,
                                   const QString &notes) {
                 restore();
+
+                // A version the user skipped is not offered again. The setting existed and was
+                // saved, but nothing ever read it, so "skip" could not work - the same version
+                // came back on every launch with no way to stop it.
+                const Settings current = m_store->load();
+                if (!current.skippedVersion.isEmpty() && current.skippedVersion == version) {
+                    setUpdateStatus(
+                        QStringLiteral("Version %1 skipped. A newer version will be offered.")
+                            .arg(version),
+                        false);
+                    once->deleteLater();
+                    return;
+                }
+
                 setUpdateStatus(QStringLiteral("Version %1 is available.").arg(version), false);
                 m_updater->offerUpdate(version, url, notes);
                 once->deleteLater();
             });
+    connect(m_updater, &Updater::updateSkipped, this, [this](const QString &version) {
+        // Persisted, so the check at the next launch honours it before offering anything.
+        Settings s = m_store->load();
+        s.skippedVersion = version;
+        QString error;
+        m_store->save(s, &error);
+        setUpdateStatus(QStringLiteral("Version %1 skipped. A newer version will be offered.")
+                            .arg(version),
+                        false);
+    });
+    connect(m_updater, &Updater::updateDeferred, this, [this](const QString &version) {
+        setUpdateStatus(QStringLiteral("Update %1 postponed. It will be offered again.")
+                            .arg(version),
+                        false);
+
+        // Offered again later in the same session, not only at the next launch: a machine that
+        // stays on for days would otherwise never mention it again. One timer, restarted rather
+        // than stacked, so choosing Later twice does not queue two prompts.
+        if (!m_updateSnooze) {
+            m_updateSnooze = new QTimer(this);
+            m_updateSnooze->setSingleShot(true);
+            m_updateSnooze->setInterval(kUpdateSnoozeMs);
+            connect(m_updateSnooze, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
+        }
+        m_updateSnooze->start();
+    });
+
     connect(m_updater, &Updater::upToDate, once,
             [this, once, restore, announce](const QString &version) {
                 restore();
