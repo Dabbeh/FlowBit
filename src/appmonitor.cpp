@@ -73,7 +73,14 @@ constexpr GUID kKernelNetworkProvider = {
 //      other way round.
 constexpr USHORT kTcpSend = 10;         // upload
 constexpr USHORT kTcpRecv = 11;         // download
-constexpr USHORT kTcpRetransmit = 14;   // a retransmission of sent data
+constexpr USHORT kTcpRetransmit = 14;
+
+// Event schema blobs, keyed by event id and version.
+//
+// Shared ownership because a blob is handed out under the lock and used after it: the entry may
+// be evicted while a decoding pass is still reading it.
+QHash<quint32, std::shared_ptr<std::vector<BYTE>>> schemaCache;
+QMutex schemaMutex;   // a retransmission of sent data
 constexpr USHORT kTcpIpv6Send = 26;     // upload, IPv6
 constexpr USHORT kTcpIpv6Recv = 27;     // download, IPv6
 constexpr USHORT kTcpIpv6Retransmit = 30;
@@ -204,6 +211,15 @@ public:
     QString etwBlockedReason;
     int silentTicks = 0;
     quint64 lastSeenSample = 0;
+
+    // Whether ETW has delivered at least one real event in this session.
+    //
+    // Once it has, silence can only mean "no traffic", never "the source is broken".
+    // Without this latch an idle machine - every application reading 0 B/s - produced three
+    // silent ticks and the monitor declared ETW dead, switched to the TCP fallback and
+    // showed a warning under the table. The warning then disappeared as soon as traffic
+    // arrived, so the panel appeared to flap between sources while ETW was working fine.
+    bool etwProven = false;
 
     struct ConnKey {
         quint32 localAddr;
@@ -450,6 +466,18 @@ void WINAPI eventCallback(PEVENT_RECORD record)
         return;
 
     impl->eventsSeen.fetch_add(1);
+    impl->etwProven = true;   // proof, from now on, that this source works
+
+    // Retransmissions arrive as their own events (ids 14 and 30) and carry the size of data that
+    // was already counted when it was first sent. Adding them again inflates per-application
+    // usage above the traffic that actually moved - and it makes the figure disagree with the
+    // TCP-counter source, whose DataBytes numbers count sequence space rather than wire repeats,
+    // so the same app would read differently depending on which source happened to be active.
+    //
+    // They are still proof that the source is alive, which is why the latch above runs first, but
+    // they contribute no bytes.
+    if (id == kTcpRetransmit || id == kTcpIpv6Retransmit)
+        return;
 
     // NOTE: the owning process comes from the payload's PID property (read
     // below), NOT from EventHeader.ProcessId. Using the header was part of the
@@ -457,14 +485,47 @@ void WINAPI eventCallback(PEVENT_RECORD record)
 
     // Resolve the payload properties through TDH. Match by NAME - the byte
     // layout differs across Windows builds, but the field names are stable.
-    ULONG bufferSize = 0;
-    if (TdhGetEventInformation(record, 0, nullptr, nullptr, &bufferSize) != ERROR_INSUFFICIENT_BUFFER)
-        return;
+    //
+    // The schema is fetched ONCE per event id and version and then reused.
+    //
+    // TdhGetEventInformation is not a cheap accessor: it resolves the provider's manifest and
+    // builds the property table, and it was being called twice for every single event - once to
+    // measure the buffer and once to fill it. While traffic was busy that dominated the process's
+    // CPU time, which is what made Flowbit cost measurable battery while sitting in the tray with
+    // the window closed. The blob is immutable for a given id and version, so caching it removes
+    // the work entirely after the first event of each kind.
+    const quint32 schemaKey = (quint32(id) << 16)
+                              | quint32(record->EventHeader.EventDescriptor.Version);
 
-    std::vector<BYTE> infoBuf(bufferSize);
-    auto *info = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuf.data());
-    if (TdhGetEventInformation(record, 0, nullptr, info, &bufferSize) != ERROR_SUCCESS)
-        return;
+    std::shared_ptr<std::vector<BYTE>> schema;
+    {
+        QMutexLocker lock(&schemaMutex);
+        const auto it = schemaCache.constFind(schemaKey);
+        if (it != schemaCache.constEnd())
+            schema = *it;
+    }
+
+    if (!schema) {
+        ULONG bufferSize = 0;
+        if (TdhGetEventInformation(record, 0, nullptr, nullptr, &bufferSize)
+            != ERROR_INSUFFICIENT_BUFFER)
+            return;
+
+        auto fresh = std::make_shared<std::vector<BYTE>>(bufferSize);
+        auto *freshInfo = reinterpret_cast<PTRACE_EVENT_INFO>(fresh->data());
+        if (TdhGetEventInformation(record, 0, nullptr, freshInfo, &bufferSize) != ERROR_SUCCESS)
+            return;
+
+        QMutexLocker lock(&schemaMutex);
+        // Bounded: a provider with many ids must not grow this without limit. Sixteen kinds cover
+        // this provider's TCP events several times over.
+        if (schemaCache.size() >= 16)
+            schemaCache.clear();
+        schemaCache.insert(schemaKey, fresh);
+        schema = fresh;
+    }
+
+    auto *info = reinterpret_cast<PTRACE_EVENT_INFO>(schema->data());
 
     // ---------------------------------------------------------------------
     // Payload decode, written against the schema in
@@ -788,6 +849,20 @@ void AppMonitor::Impl::noteAddressMiss(quint32 saddr, quint32 daddr, bool sLocal
 void AppMonitor::Impl::ingest(const NetEvent &event)
 {
     QMutexLocker lock(&mutex);
+
+    // Exactly one source may feed the counters.
+    //
+    // Both ETW and the TCP-counter fallback add into inBytes/outBytes, and nothing stopped them
+    // from doing so during the same window: while the fallback was the chosen source the ETW
+    // session was still alive and still delivering events for the same connections, so the same
+    // traffic was counted twice. The result was per-application usage that read higher than the
+    // traffic that actually moved - reported as the numbers "not exactly accurate".
+    //
+    // The guard sits here, at the accumulation point, rather than at the call sites: a future
+    // caller cannot reintroduce the overlap by forgetting to check the flag.
+    if (useEstats)
+        return;
+
     if (event.send)
         outBytes[event.pid] += event.size;
     else
@@ -910,6 +985,13 @@ void AppMonitor::Impl::applyEstatsDeltas(const QHash<quint32, quint64> &inDelta,
                                          const QHash<quint32, quint64> &outDelta)
 {
     QMutexLocker lock(&mutex);
+
+    // The other half of the same rule: the fallback contributes only while it is the chosen
+    // source. See ingest() for why the pair must be mutually exclusive rather than merely
+    // usually so.
+    if (!useEstats)
+        return;
+
     for (auto it = inDelta.constBegin(); it != inDelta.constEnd(); ++it)
         inBytes[it.key()] += it.value();
     for (auto it = outDelta.constBegin(); it != outDelta.constEnd(); ++it)
@@ -1517,10 +1599,8 @@ QString AppMonitor::fallbackReason() const
     if (!m_impl->etwBlockedReason.isEmpty())
         return m_impl->etwBlockedReason;
     if (m_impl->useEstats)
-        return QStringLiteral("The detailed ETW source is delivering no events on this "
-                              "Windows build, so applications are measured from their TCP "
-                              "connection counters instead: the figures are real, but UDP "
-                              "and QUIC traffic is not counted.");
+        return QStringLiteral("Measuring TCP only - this Windows build delivers no ETW "
+                              "events, so UDP and QUIC are not counted.");
     return QString();
 }
 
@@ -1666,16 +1746,22 @@ void AppMonitor::tick()
     const bool etwUnavailable = !m_impl->etwBlockedReason.isEmpty();
     if (!etwUnavailable) {
         const quint64 seenNow = m_impl->eventsSeen.load();
-        if (m_impl->eventsSeen.load() == m_impl->lastSeenSample) {
-            if (!m_impl->useEstats && ++m_impl->silentTicks >= 3)
-                m_impl->useEstats = true;
-        } else {
+        if (seenNow != m_impl->lastSeenSample) {
+            // Events arrived. ETW is proven for the rest of the session, and anything the
+            // fallback was contributing is dropped so the two never double-count.
+            m_impl->etwProven = true;
             m_impl->silentTicks = 0;
             if (m_impl->useEstats) {
-                // ETW recovered; stop feeding from EStats to avoid double counting.
                 m_impl->useEstats = false;
                 m_impl->connLast.clear();
             }
+        } else if (!m_impl->etwProven) {
+            // Silence, and this source has never delivered anything - only then is it fair to
+            // conclude it does not work on this build. Silence alone is not evidence: an idle
+            // machine sends nothing, and treating that as a fault made the panel accuse ETW of
+            // being broken whenever the connection was quiet.
+            if (!m_impl->useEstats && ++m_impl->silentTicks >= 3)
+                m_impl->useEstats = true;
         }
         m_impl->lastSeenSample = seenNow;
     }

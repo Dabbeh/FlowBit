@@ -327,7 +327,10 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     m_rankTimer = new QTimer(this);
     m_rankTimer->setInterval(kRankIntervalMs);
     connect(m_rankTimer, &QTimer::timeout, this, [this] {
-        if (m_expanded)
+        // Expanded AND on screen. The timer used to rebuild the table while the panel was
+        // collapsed out of sight or while another page was showing, which cost a re-sort and a
+        // full row rebuild every three seconds for output nobody could see.
+        if (m_expanded && isVisible())
             refresh();
     });
     m_rankTimer->start();
