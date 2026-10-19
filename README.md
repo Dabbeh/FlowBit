@@ -186,4 +186,10 @@ reference/     logo source assets
 ## Licensing
 
 Flowbit is built on WinDivert, distributed under the GNU Lesser General Public License
-v3. See `third_party/WinDivert/` for its license and the source distribution it requires.
+v3. The license text ships in `third_party/WinDivert/LICENSE`.
+
+WinDivert is linked as an unmodified DLL, so the LGPL obligations are met by shipping
+the library beside the executable together with its license. Its source is available
+from [github.com/basil00/WinDivert](https://github.com/basil00/WinDivert), and its
+homepage with full documentation is
+[reqrypt.org/windivert.html](https://reqrypt.org/windivert.html).
