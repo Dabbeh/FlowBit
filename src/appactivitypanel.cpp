@@ -49,6 +49,14 @@ QTableWidgetItem *makeItem(const QString &text, Qt::Alignment align)
     return item;
 }
 
+
+// Reveal and settle timing.
+//
+// 280ms is the reveal: InOutSine starts at zero velocity, so a shorter duration reads as a
+// hesitation before the panel moves at all. The settle is deliberately much shorter - it is
+// a correction, not a second movement, and anything longer would read as two motions.
+constexpr int kRevealMs = 280;
+constexpr int kSettleMs = 140;
 } // namespace
 
 AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
@@ -313,8 +321,25 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
         // open could settle at the wrong height.
         m_animating = false;
         refresh();
-        if (m_animHeight >= 0) {
+        if (m_animHeight >= 0 && m_expanded) {
             const int want = qMax(120, sizeHint().height());
+            const int delta = qAbs(want - m_animHeight);
+
+            // A residual difference here means the content changed while the tween ran - rows
+            // arrived, the empty state gave way to a table, and so on. Snapping to the new height
+            // is a visible step at the end of an otherwise smooth motion, so anything beyond a
+            // few pixels is travelled as a short settle instead. Small differences are applied
+            // directly: a 4px tween would read as a twitch, not as motion.
+            if (delta > 8) {
+                m_animating = true;
+                m_expandAnim->stop();
+                m_expandAnim->setDuration(kSettleMs);
+                m_expandAnim->setEasingCurve(QEasingCurve::OutCubic);
+                m_expandAnim->setStartValue(m_animHeight);
+                m_expandAnim->setEndValue(want);
+                m_expandAnim->start();
+                return;   // finished() runs again when the settle completes
+            }
             if (want != m_animHeight)
                 setAnimHeight(want);
         }
@@ -395,11 +420,21 @@ void AppActivityPanel::setExpanded(bool expanded)
             // children apply, so applying it first makes sizeHint() describe the
             // state about to be shown. A floor of 120px keeps a momentarily-empty
             // panel from collapsing to a sliver mid-reveal.
+            // The rows are filled BEFORE the target is measured.
+            //
+            // Measuring first and filling at the end made the reveal animate the EMPTY state and
+            // then pop the real rows in, followed by a height correction - the panel appeared to
+            // finish opening and then jump. m_animating is raised first so refresh() cannot pin
+            // the height mid-measure; it only suppresses that correction, not the rebuild.
+            m_animating = true;
             updateStateVisibility();
+            refresh();
+
             const int target = qMax<int>(120, sizeHint().height());
 
-            m_animating = true;
             m_expandAnim->stop();
+            m_expandAnim->setDuration(kRevealMs);
+            m_expandAnim->setEasingCurve(QEasingCurve::InOutSine);
             m_expandAnim->setStartValue(1);
             m_expandAnim->setEndValue(target);
             // Jump straight to the collapsed height so the first frame is already
