@@ -77,9 +77,9 @@ int main(int argc, char *argv[])
     //    source is broken. Measured by content rather than by length: reconstructing the runtime
     //    string from source text proved unreliable, and an unreliable check that passes is worse
     //    than no check at all.
-    check(src.contains(QStringLiteral("Measuring TCP only")),
-          "the fallback note leads with what is actually being measured");
-    check(src.contains(QStringLiteral("events, so UDP and QUIC are not counted.")),
+    check(src.contains(QStringLiteral("TCP only \\u2014 UDP and QUIC are not counted.")),
+          "the fallback note is the one short sentence");
+    check(src.contains(QStringLiteral("UDP and QUIC are not counted")),
           "and names the traffic it cannot count");
     check(!src.contains(QStringLiteral("The detailed ETW source is delivering no events")),
           "the three-line wording that read as a fault is gone");

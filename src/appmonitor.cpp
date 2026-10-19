@@ -1599,8 +1599,7 @@ QString AppMonitor::fallbackReason() const
     if (!m_impl->etwBlockedReason.isEmpty())
         return m_impl->etwBlockedReason;
     if (m_impl->useEstats)
-        return QStringLiteral("Measuring TCP only - this Windows build delivers no ETW "
-                              "events, so UDP and QUIC are not counted.");
+        return QStringLiteral("TCP only \u2014 UDP and QUIC are not counted.");
     return QString();
 }
 
@@ -1643,11 +1642,10 @@ bool AppMonitor::start()
             QMutexLocker lock(&m_impl->mutex);
             m_impl->useEstats = true;
             m_impl->silentTicks = 0;
-            m_impl->etwBlockedReason =
-                QStringLiteral("Flowbit is not running with Administrator rights, so the "
-                               "detailed ETW source is unavailable. Applications are "
-                               "measured from their TCP connection counters instead: the "
-                               "figures are real, but UDP and QUIC traffic is not counted.");
+            // One short line. It sits under a table, so every extra clause costs a row of
+            // data: the full explanation - why the source is unavailable and what that
+            // implies - is in Settings -> Diagnostics, which is where a sentence belongs.
+            m_impl->etwBlockedReason = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted.");
             m_impl->error.clear();
             m_lastTick = std::chrono::steady_clock::now();
             m_tickCount = 0;
