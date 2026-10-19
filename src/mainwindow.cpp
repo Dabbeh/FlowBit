@@ -3964,10 +3964,16 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Hide to the tray and keep running, which is what Flowbit has always done.
     QMainWindow::closeEvent(event);
     if (settings.closeToTray && m_tray && m_tray->isVisible()) {
-        // Say where the window went, once, so hiding is not mistaken for nothing happening.
-        static bool toldOnce = false;
-        if (!toldOnce) {
-            toldOnce = true;
+        // Say where the window went, ONCE - and once means once, not once per launch.
+        //
+        // This was a function-local static, so it reset with the process: a user who closes the
+        // window daily saw the same notification daily. The flag is stored now, so the hint
+        // appears on the first close after installation and never again.
+        Settings hintSettings = m_store->load();
+        if (!hintSettings.trayHintShown) {
+            hintSettings.trayHintShown = true;
+            QString hintError;
+            m_store->save(hintSettings, &hintError);
             m_tray->showMessage(
                 QStringLiteral("Flowbit"),
                 QStringLiteral("Flowbit keeps running in the notification area so "

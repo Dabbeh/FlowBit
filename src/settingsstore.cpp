@@ -294,6 +294,7 @@ Settings SettingsStore::load() const
         root.value(QStringLiteral("checkForUpdates")).toBool(true);
     settings.skippedVersion =
         root.value(QStringLiteral("skippedVersion")).toString();
+    settings.trayHintShown = root.value(QStringLiteral("trayHintShown")).toBool(false);
 
     // Appearance. Unknown or missing values fall back to Auto, so an older
     // settings file simply follows the OS.
@@ -378,6 +379,11 @@ bool SettingsStore::save(const Settings &settings, QString *error) const
     root.insert(QStringLiteral("checkForUpdates"), settings.checkForUpdates);
     if (!settings.skippedVersion.isEmpty())
         root.insert(QStringLiteral("skippedVersion"), settings.skippedVersion);
+
+    // Written only when true: a false value is the default, and an older Flowbit reading this
+    // file ignores the key rather than failing to parse it.
+    if (settings.trayHintShown)
+        root.insert(QStringLiteral("trayHintShown"), true);
     root.insert(QStringLiteral("themeMode"),
                 settings.themeMode == Settings::ThemeMode::Light
                     ? QStringLiteral("light")

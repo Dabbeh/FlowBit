@@ -149,6 +149,12 @@ struct Settings {
     // The version the user chose to skip, so a dismissed update is not offered again on
     // every launch. Empty means nothing has been skipped.
     QString skippedVersion;
+
+    // Whether the "Flowbit keeps running in the notification area" hint has been shown.
+    //
+    // It was a function-local static, so it reset on every launch: anyone who closes the window
+    // daily saw the same notification daily. One-time means once, so the flag is stored.
+    bool trayHintShown = false;
 };
 
 // The limits that are in force right now, plus why.
