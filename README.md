@@ -185,6 +185,13 @@ reference/     logo source assets
 
 ## Licensing
 
+Flowbit itself is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE) - see `LICENSE`. In plain terms:
+**use it, copy it, modify it and share it for anything personal or non-commercial,
+with credit; commercial use of any kind needs written permission from the author.**
+Forks and repos that reuse the code must keep the copyright notice and license file
+intact, which carries the attribution.
+
 Flowbit is built on WinDivert, distributed under the GNU Lesser General Public License
 v3. The license text ships in `third_party/WinDivert/LICENSE`.
 
