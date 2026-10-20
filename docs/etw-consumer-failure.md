@@ -82,6 +82,22 @@ Diagnostics → Monitoring:
   That is the remaining unknown state, and it is the one that needs WPR on the machine:
   `wpr -start GeneralProfile -start Network` for 10 seconds, then compare with Flowbit's rows.
 
+
+## QUIC is not a separate case
+
+QUIC - and HTTP/3, which most video sites now use - runs **over UDP**, normally to port 443. There is
+no separate QUIC provider, no separate counter and nothing extra to decode: a QUIC stream appears in
+this provider as UDP send/receive events (ids 42/43, or 58/59 on IPv6), attributed to the owning
+process like any other traffic.
+
+So the relationship is strictly one-way:
+
+  * UDP events arriving  -> QUIC is counted, for free
+  * UDP events absent    -> QUIC is absent too, and no amount of QUIC-specific work changes that
+
+That is why the fallback note reads "TCP only - UDP and QUIC are not counted": the TCP counter source
+has no visibility of either, and both return together.
+
 ## Files changed for this
 
 | File | Change |

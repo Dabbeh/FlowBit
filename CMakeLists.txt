@@ -31,7 +31,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Qt
 # ---------------------------------------------------------------------------
-find_package(Qt6 REQUIRED COMPONENTS Widgets Svg)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
 
 # ---------------------------------------------------------------------------
 # WinDivert (bundled, see third_party/WinDivert)
@@ -110,6 +110,28 @@ add_executable(Flowbit WIN32
     src/diagnostics.cpp
     src/diagnosticspanel.h
     src/diagnosticspanel.cpp
+    src/theme.h
+    src/theme.cpp
+    src/checkmark.h
+    src/checkmark.cpp
+    src/busydots.h
+    src/busydots.cpp
+    src/crossticon.h
+    src/crossticon.cpp
+    src/navicons.h
+    src/navicons.cpp
+    src/navbutton.h
+    src/navbutton.cpp
+    src/scrollbaranimator.h
+    src/scrollbaranimator.cpp
+    src/autostart.h
+    src/autostart.cpp
+    src/etwclass.h
+    src/etwclass.cpp
+    src/selftest.h
+    src/selftest.cpp
+    src/updater.h
+    src/updater.cpp
     src/app.rc
 )
 
@@ -122,6 +144,7 @@ target_link_directories(Flowbit PRIVATE "${WINDIVERT_ARCH_DIR}")
 target_link_libraries(Flowbit PRIVATE
     Qt6::Widgets
     Qt6::Svg
+    Qt6::Network
     windivert        # WinDivert import library (WinDivert.lib)
     dwmapi
     iphlpapi         # GetIfTable2 for live throughput
@@ -133,6 +156,7 @@ target_link_libraries(Flowbit PRIVATE
     psapi
     shell32
     user32
+    winmm            # timeBeginPeriod for precise per-app timing
 )
 
 # windres needs to find the .manifest referenced from app.rc
