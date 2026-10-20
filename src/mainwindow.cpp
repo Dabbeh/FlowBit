@@ -1773,6 +1773,38 @@ QWidget *MainWindow::buildUsageCard(QWidget *parent)
     quotaRow->addStretch(1);
     layout->addLayout(quotaRow);
 
+    // What the cycle total is made of, and where it is heading.
+    //
+    // The card is as tall as the graph card beside it, and the stretch below used to leave all of
+    // that height blank. These two lines and the projection use it for something the user can act
+    // on: how much went each way, and what the cycle will end at if nothing changes.
+    auto *splitRow = new QHBoxLayout();
+    splitRow->setSpacing(24);
+    splitRow->setContentsMargins(0, 10, 0, 0);
+
+    auto makeSplit = [&](const QString &caption, QLabel **value) {
+        auto *column = new QVBoxLayout();
+        column->setSpacing(2);
+        auto *cap = new QLabel(caption, card);
+        cap->setObjectName(QStringLiteral("sub"));
+        *value = new QLabel(QStringLiteral("--"), card);
+        (*value)->setFont(theme::counterFont(11, true));
+        column->addWidget(cap);
+        column->addWidget(*value);
+        auto *holder = new QWidget(card);
+        holder->setLayout(column);
+        return holder;
+    };
+    splitRow->addWidget(makeSplit(QStringLiteral("Downloaded"), &m_usageSplitDown));
+    splitRow->addWidget(makeSplit(QStringLiteral("Uploaded"), &m_usageSplitUp));
+    splitRow->addStretch(1);
+    layout->addLayout(splitRow);
+
+    m_usageProjection = new QLabel(QStringLiteral("At this rate: --"), card);
+    m_usageProjection->setObjectName(QStringLiteral("sub"));
+    m_usageProjection->setWordWrap(true);
+    layout->addWidget(m_usageProjection);
+
     layout->addStretch(1);
 
     // Action tray: its own row, with real margins and a floor on button width so
@@ -2922,6 +2954,31 @@ void MainWindow::refreshUsage()
                                 .arg(usedGb, 0, 'f', usedGb < 10.0 ? 2 : 1)
                                 .arg(quotaGb, 0, 'f', quotaGb < 10.0 ? 2 : 0));
     m_usageBar->setProgress(total / quota);
+
+    // Per-direction split. formatBytes scales to the right unit for each, which is right here:
+    // these are two independent readings, not two halves of one number.
+    m_usageSplitDown->setText(formatBytes(double(m_usage->cycleDownBytes())));
+    m_usageSplitUp->setText(formatBytes(double(m_usage->cycleUpBytes())));
+
+    // Projection: the cycle so far, extrapolated over its whole length. Only shown once there is
+    // enough of the cycle behind it to mean something - extrapolating from one hour on day one
+    // produces a fantasy number, and a wrong figure is worse than none.
+    {
+        const QDate start = UsageTracker::cycleStartDate(settings.usage);
+        const int elapsed = qMax(1, start.daysTo(QDate::currentDate()) + 1);
+        const int length = qMax(elapsed, start.daysTo(m_usage->cycleEnd(settings.usage)) + 1);
+        if (elapsed >= 2 && total > 0.0) {
+            const double projected = (total / elapsed) * length;
+            m_usageProjection->setText(
+                QStringLiteral("At this rate: %1 by %2 \u00b7 %3 per day")
+                    .arg(formatBytes(projected), m_usage->cycleEnd(settings.usage).toString(
+                                                    QStringLiteral("MMM d")),
+                         formatBytes(total / elapsed)));
+        } else {
+            m_usageProjection->setText(
+                QStringLiteral("At this rate: a projection appears after a full day of the cycle"));
+        }
+    }
 
     const int days = m_usage->daysUntilReset(settings.usage);
     const QDate end = m_usage->cycleEnd(settings.usage);

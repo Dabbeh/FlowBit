@@ -297,6 +297,13 @@ private:
     // -- zone 2: usage ------------------------------------------------------
     QLabel *m_usageReading = nullptr;
     QLabel *m_usageReset = nullptr;
+
+    // Fills the space the quota card used to leave empty. The card is stretched to match the card
+    // beside it (which grew when the graph became taller), and an empty half looks like a loading
+    // failure rather than a deliberately sparse card. These show what the cycle is made of.
+    QLabel *m_usageSplitDown = nullptr;
+    QLabel *m_usageSplitUp = nullptr;
+    QLabel *m_usageProjection = nullptr;
     SegmentedBar *m_usageBar = nullptr;
     QDoubleSpinBox *m_quotaSpin = nullptr;
 

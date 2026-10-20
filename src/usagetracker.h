@@ -52,6 +52,11 @@ public:
     quint64 cycleDownBytes() const;
     quint64 cycleUpBytes() const;
 
+    // Where the current cycle began. Public because callers that need to project usage ("at this
+    // rate, N GB by <date>") need the same answer the tracker uses for its own totals - deriving
+    // it separately is how two parts of one screen end up disagreeing.
+    static QDate cycleStartDate(const UsageConfig &config);
+
     // One entry per day in the cycle that has recorded usage.
     struct DayUsage {
         QDate date;
@@ -106,7 +111,6 @@ signals:
     void usageChanged();
 
 private:
-    static QDate cycleStartDate(const UsageConfig &config);
     static QDate cycleEndDate(const UsageConfig &config);
     QString fileForMonth(const QDate &month) const;
     void loadMonth(const QDate &month);
