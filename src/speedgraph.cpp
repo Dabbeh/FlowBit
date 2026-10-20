@@ -107,6 +107,35 @@ double SpeedGraph::averageUp() const
     return sum / double(m_up.size());
 }
 
+void SpeedGraph::separateLabelCentres(qreal *first, qreal *second, qreal minGap, qreal top,
+                                      qreal bottom)
+{
+    if (!first || !second)
+        return;
+
+    if (*second < *first)
+        std::swap(*first, *second);
+
+    const qreal gap = *second - *first;
+    if (gap < minGap) {
+        const qreal push = (minGap - gap) / 2.0;
+        *first -= push;
+        *second += push;
+    }
+
+    // Keep both inside the plot; if the pair cannot fit, prefer the upper one's position.
+    if (*first < top) {
+        const qreal shift = top - *first;
+        *first += shift;
+        *second += shift;
+    }
+    if (*second > bottom) {
+        const qreal shift = *second - bottom;
+        *first = qMax(top, *first - shift);
+        *second = bottom;
+    }
+}
+
 void SpeedGraph::drawAverages(QPainter &p, const QRectF &plot, double maxValue) const
 {
     if (m_down.isEmpty())
@@ -127,23 +156,61 @@ void SpeedGraph::drawAverages(QPainter &p, const QRectF &plot, double maxValue) 
         {averageUp(), theme::kGraphUpload(), QStringLiteral("avg \u2191")},
     };
 
+    // Which lines are actually drawn, and where their labels want to sit.
+    QVector<QPair<const Line *, qreal>> shown;
     for (const Line &line : lines) {
-        if (line.value <= 0.0)
-            continue;
-        const qreal y = yFor(line.value);
+        if (line.value > 0.0)
+            shown.append({&line, yFor(line.value)});
+    }
+    if (shown.isEmpty())
+        return;
 
+    // Two labels, separated if they would overlap.
+    if (shown.size() == 2) {
+        qreal first = shown[0].second;
+        qreal second = shown[1].second;
+        const qreal badgeHeight = QFontMetricsF(theme::uiFont(8, false)).height() + 6.0;
+        separateLabelCentres(&first, &second, badgeHeight + 2.0, plot.top() + badgeHeight / 2.0,
+                             plot.bottom() - badgeHeight / 2.0);
+        shown[0].second = first;
+        shown[1].second = second;
+    }
+
+    const QFont labelFont = theme::uiFont(8, false);
+    p.setFont(labelFont);
+    const QFontMetricsF metrics(labelFont);
+
+    for (const auto &entry : shown) {
+        const Line &line = *entry.first;
+
+        // The average itself: a dashed rule across the plot.
         QPen pen(line.colour, 1, Qt::DashLine);
         pen.setDashPattern({4, 3});
         p.setPen(pen);
-        p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+        p.drawLine(QPointF(plot.left(), entry.second), QPointF(plot.right(), entry.second));
 
-        // Label inside the plot, at the left edge: the right edge belongs to the axis labels, and
-        // overlapping them would be worse than a slightly cramped label.
-        p.setPen(theme::kTextMuted());
-        p.setFont(theme::uiFont(8, false));
-        const QRectF labelRect(plot.left() + 4, y - 14, 120, 13);
-        p.drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter,
-                   QStringLiteral("%1 %2").arg(line.label, formatRate(line.value)));
+        // The label, on its own opaque badge.
+        //
+        // Drawn straight onto the trace before this, in muted grey: over the filled mountain it was
+        // unreadable, and with both averages near zero the two labels overprinted each other. A
+        // filled badge in the card's own colour makes it legible whatever is behind it, and the
+        // text uses the direction colour so the label belongs to its line.
+        const QString text = QStringLiteral("%1 %2").arg(line.label, formatRate(line.value));
+        const QRectF textBounds = metrics.boundingRect(text);
+        const qreal badgeWidth = textBounds.width() + 10.0;
+        const qreal badgeHeight = textBounds.height() + 5.0;
+        QRectF badge(plot.left() + 4.0, entry.second - badgeHeight / 2.0, badgeWidth, badgeHeight);
+        if (badge.top() < plot.top())
+            badge.moveTop(plot.top());
+        if (badge.bottom() > plot.bottom())
+            badge.moveBottom(plot.bottom());
+
+        p.setPen(QPen(theme::kBorder(), 1));
+        p.setBrush(theme::kPanel());
+        p.drawRoundedRect(badge, 3, 3);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(line.colour);
+        p.drawText(badge, Qt::AlignCenter, text);
     }
 }
 

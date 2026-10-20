@@ -36,6 +36,14 @@ public:
     double averageDown() const;
     double averageUp() const;
 
+    // Pushes two label centre points apart until they are at least `minGap` apart, keeping both
+    // inside [top, bottom]. Public and static so the rule can be tested without painting.
+    //
+    // Needed because the two averages are frequently within a few pixels of each other - an idle
+    // machine has both near zero - and the labels then overprinted into an unreadable smear.
+    static void separateLabelCentres(qreal *first, qreal *second, qreal minGap, qreal top,
+                                     qreal bottom);
+
     // Taller by default, and free to grow: the card gives it stretch, so a maximised window
     // spends the extra height on the graph rather than leaving it fixed while everything else
     // grows.
@@ -50,6 +58,7 @@ private:
     void drawMountain(QPainter &p, const QRectF &plot, double maxValue) const;
     void drawCeiling(QPainter &p, const QRectF &plot, double maxValue) const;
     void drawAverages(QPainter &p, const QRectF &plot, double maxValue) const;
+
     void drawAxisLabels(QPainter &p, const QRectF &plot, double maxValue) const;
 
     static constexpr int kCapacity = 60;

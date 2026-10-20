@@ -8,6 +8,9 @@
 #include "speedgraph.h"
 
 #include <QApplication>
+#include <QImage>
+#include <QPainter>
+#include <QSet>
 #include <cstdio>
 
 using namespace net;
@@ -140,6 +143,56 @@ int main(int argc, char *argv[])
               "and is allowed to grow with the window");
         g.clearHistory();
         check(g.averageDown() == 0.0, "clearing the history clears the averages");
+    }
+
+    // ---- average labels stay readable -------------------------------------
+    {
+        // Two averages within 2px of each other - an idle machine - must not overprint.
+        qreal a = 100.0, b = 102.0;
+        SpeedGraph::separateLabelCentres(&a, &b, 16.0, 10.0, 200.0);
+        std::printf("  2px apart -> %.1f and %.1f\n", a, b);
+        check(b - a >= 16.0, "labels closer than the gap are pushed apart");
+        check(a < b, "and keep their order");
+
+        qreal c = 100.0, d = 140.0;
+        SpeedGraph::separateLabelCentres(&c, &d, 16.0, 10.0, 200.0);
+        check(qFuzzyCompare(c + 1.0, 101.0) && qFuzzyCompare(d + 1.0, 141.0),
+              "labels already apart are left where they are");
+
+        qreal e = 11.0, f = 12.0;
+        SpeedGraph::separateLabelCentres(&e, &f, 16.0, 10.0, 200.0);
+        std::printf("  near the top -> %.1f and %.1f\n", e, f);
+        check(e >= 10.0 - 0.01 && f <= 200.0, "the pair stays inside the plot");
+
+        qreal g = 198.0, h = 199.0;
+        SpeedGraph::separateLabelCentres(&g, &h, 16.0, 10.0, 200.0);
+        std::printf("  near the bottom -> %.1f and %.1f\n", g, h);
+        check(g >= 10.0 && h <= 200.0 + 0.01, "and at the bottom too");
+    }
+
+    // ---- the paint path, with badges, actually runs ----------------------
+    {
+        SpeedGraph graph;
+        graph.resize(400, 200);
+        for (int i = 0; i < 20; ++i)
+            graph.addSample(1000.0 + i * 3000.0, 800.0 + i * 200.0);
+
+        // grab() needs a platform surface and returns a null image offscreen; render() into an
+        // image exercises the same paintEvent without one.
+        QImage canvas(400, 200, QImage::Format_ARGB32_Premultiplied);
+        canvas.fill(Qt::transparent);
+        {
+            QPainter painter(&canvas);
+            graph.render(&painter);
+        }
+        QSet<QRgb> colours;
+        for (int y = 0; y < canvas.height(); y += 3)
+            for (int x = 0; x < canvas.width(); x += 3)
+                colours.insert(canvas.pixel(x, y));
+        std::printf("  distinct colours in the render: %d\n", colours.size());
+        check(colours.size() > 5, "the graph paints its grid, trace and average badges");
+        check(graph.averageDown() > 0.0 && graph.averageUp() > 0.0,
+              "and both averages are non-zero for the labels to show");
     }
 
     std::printf("\n%d checks, %d failures\n%s\n", g_checks, g_failures,
