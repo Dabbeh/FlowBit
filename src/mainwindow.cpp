@@ -2897,7 +2897,30 @@ void MainWindow::refreshStatistics()
                                         : QStringLiteral("View All (%1)").arg(apps.size()));
         }
         const int shown = qMin(apps.size(), m_appUsageShowAll ? apps.size() : 10);
-        m_appUsageTable->setRowCount(shown);
+
+        // What is left over, shown instead of silently missing.
+        //
+        // Measured on a real machine: the machine total for the day was 9,848 MB while the
+        // attributed rows summed to 4,136 MB - 58% absent, and a user comparing against qBittorrent's
+        // own "600 MB downloaded" read 182 MB and reasonably called the table wrong. The causes are
+        // mundane (system processes carry no application, and for a while the monitor only ran while
+        // the panel was open), but a table that simply omits them looks like a broken counter.
+        //
+        // The remainder is therefore its own row, labelled for what it is.
+        quint64 attributedDown = 0;
+        quint64 attributedUp = 0;
+        for (const UsageTracker::AppUsage &a : apps) {
+            attributedDown += a.down;
+            attributedUp += a.up;
+        }
+        const quint64 cycleDown = m_usage->cycleDownBytes();
+        const quint64 cycleUp = m_usage->cycleUpBytes();
+        const quint64 restDown = cycleDown > attributedDown ? cycleDown - attributedDown : 0;
+        const quint64 restUp = cycleUp > attributedUp ? cycleUp - attributedUp : 0;
+        const quint64 rest = restDown + restUp;
+        const bool hasRemainder = rest > (1u << 20);   // more than a megabyte is worth a row
+
+        m_appUsageTable->setRowCount(shown + (hasRemainder ? 1 : 0));
         for (int row = 0; row < shown; ++row) {
             const UsageTracker::AppUsage &a = apps.at(row);
             const QString label = a.name.isEmpty() ? QFileInfo(a.path).fileName() : a.name;
@@ -2914,14 +2937,34 @@ void MainWindow::refreshStatistics()
             m_appUsageTable->setItem(row, 3, new QTableWidgetItem(
                                                 formatBytes(double(a.up))));
         }
+        const int totalRows = shown + (hasRemainder ? 1 : 0);
+        if (hasRemainder) {
+            const int row = shown;
+            auto *nameItem = new QTableWidgetItem(QStringLiteral("System and unattributed"));
+            nameItem->setToolTip(
+                QStringLiteral("Traffic the machine measured but could not put under an application: "
+                               "system services (svchost, DNS, Windows Update), and any time when "
+                               "monitoring was not running. It is not an error - it is the gap "
+                               "between the machine total and the rows above."));
+            nameItem->setForeground(QBrush(theme::kTextMuted()));
+            m_appUsageTable->setItem(row, 0, nameItem);
+
+            const quint64 values[3] = {rest, restDown, restUp};
+            for (int c = 1; c < 4; ++c) {
+                auto *item = new QTableWidgetItem(formatBytes(double(values[c - 1])));
+                item->setForeground(QBrush(theme::kTextMuted()));
+                m_appUsageTable->setItem(row, c, item);
+            }
+        }
+
         for (int c = 1; c < 4; ++c) {
-            for (int r = 0; r < shown; ++r) {
+            for (int r = 0; r < totalRows; ++r) {
                 if (QTableWidgetItem *it = m_appUsageTable->item(r, c))
                     it->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
             }
         }
-        m_appUsageEmpty->setVisible(shown == 0);
-        m_appUsageTable->setVisible(shown > 0);
+        m_appUsageEmpty->setVisible(totalRows == 0);
+        m_appUsageTable->setVisible(totalRows > 0);
         if (m_appUsageHint) {
             m_appUsageHint->setText(
                 shown == 0
