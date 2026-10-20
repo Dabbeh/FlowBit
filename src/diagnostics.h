@@ -63,7 +63,8 @@ DiagnosticReport collectDiagnostics(bool isElevated,
                                     const QString &eventLayout = QString(),
                                     const QString &addressMiss = QString(),
                                     const QString &rawEvents = QString(),
-                                    const QString &rawBits = QString());
+                                    const QString &rawBits = QString(),
+      const QString &eventIds = QString());
 
 // Where an exported report is written. Exposed so the UI can tell the user before
 // writing, rather than after.

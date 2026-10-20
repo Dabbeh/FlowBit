@@ -1509,6 +1509,7 @@ QWidget *MainWindow::buildSettingsPage()
             m_diagnosticsPanel->setAddressMiss(m_appMonitor->addressMissReport());
             m_diagnosticsPanel->setRawEvents(m_appMonitor->rawEventReport());
             m_diagnosticsPanel->setRawBits(m_appMonitor->rawBitsReport());
+            m_diagnosticsPanel->setEventIds(m_appMonitor->eventIdReport());
             if (m_diagnosticsPanel->isVisible())
                 m_diagnosticsPanel->refresh();
         };

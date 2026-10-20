@@ -308,7 +308,8 @@ QString DiagnosticReport::toText() const
 
 DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, quint64 udpEvents, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
                                     const QString &rawEvents,
-                                    const QString &rawBits)
+                                    const QString &rawBits,
+    const QString &eventIds)
 {
     DiagnosticReport r;
     const auto add = [&r](const QString &group, const QString &name, const QString &value,
@@ -569,6 +570,21 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
                 : QStringLiteral("No UDP events in this session. UDP is counted through the same "
                                  "ETW source as TCP; the TCP-counter fallback cannot see it. If "
                                  "UDP traffic is flowing, send the saved report."));
+
+        // Which ids the provider actually delivers.
+        //
+        // Two UDP diagnoses in a row were wrong because they were reasoned rather than observed.
+        // This row makes the stream inspectable: if 42/43/58/59 appear here, UDP is arriving and
+        // any remaining zero elsewhere is a decoding problem; if they do not, the events are not
+        // being emitted for this session and the answer is the kernel logger, not this decoder.
+        add(QStringLiteral("Monitoring"), QStringLiteral("Event ids seen"),
+            eventIds.isEmpty() ? QStringLiteral("none yet") : eventIds,
+            eventIds.isEmpty() ? DiagnosticItem::Status::Info : DiagnosticItem::Status::Ok,
+            eventIds.isEmpty()
+                ? QStringLiteral("No events have been delivered yet in this session.")
+                : QStringLiteral("Counts per event id, most frequent first. TCP send/receive are 10 "
+                                 "and 11 (26/27 for IPv6); UDP send/receive are 42 and 43 (58/59 "
+                                 "for IPv6)."));
 
         // Phase 0.1 evidence: raw address bits and the local address list.
         // Placed first in MONITORING because it is what the direction fix is

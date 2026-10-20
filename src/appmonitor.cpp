@@ -1,4 +1,7 @@
 #include "appmonitor.h"
+
+#include <algorithm>
+#include <QStringList>
 #include "etwclass.h"
 
 #include "appnames.h"
@@ -176,6 +179,15 @@ public:
     std::atomic<quint64> eventsSeen{0};
     std::atomic<quint64> eventsParsed{0};
     std::atomic<quint64> udpEvents{0};   // UDP events seen, for diagnostics
+
+    // Every event id the provider delivers, counted BEFORE classification.
+    //
+    // This exists because "UDP is not counted" has now been diagnosed twice by reasoning and been
+    // wrong both times. Ids 0..127 cover this provider with room to spare; anything above is
+    // counted in idOverflow. The report shows which ids actually arrive, so the next question
+    // ("are 42/43 in the stream at all?") is answered by data.
+    std::atomic<quint64> idCounts[128] = {};
+    std::atomic<quint64> idOverflow{0};
 
     // Per-event-id decode accounting plus the payload schema of the first event
     // seen for that id. Written by the ETW callback, read by diagnostics: this is
@@ -562,6 +574,11 @@ void WINAPI eventCallback(PEVENT_RECORD record)
         eventName = reinterpret_cast<const wchar_t *>(
             reinterpret_cast<const BYTE *>(info) + nameOffset);
     }
+
+    if (id < 128)
+        impl->idCounts[id].fetch_add(1);
+    else
+        impl->idOverflow.fetch_add(1);
 
     const etwclass::Kind kind = etwclass::classify(eventName, id);
     if (!kind.transfer)
@@ -1663,6 +1680,37 @@ bool AppMonitor::usingTcpFallback() const
 quint64 AppMonitor::eventsSeenTotal() const
 {
     return m_impl->eventsSeen.load();
+}
+
+QString AppMonitor::eventIdReport() const
+{
+    struct Entry {
+        int id;
+        quint64 count;
+    };
+    QVector<Entry> entries;
+    for (int i = 0; i < 128; ++i) {
+        const quint64 c = m_impl->idCounts[i].load();
+        if (c > 0)
+            entries.append({i, c});
+    }
+    const quint64 overflow = m_impl->idOverflow.load();
+
+    if (entries.isEmpty() && overflow == 0)
+        return QStringLiteral("none yet");
+
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry &a, const Entry &b) { return a.count > b.count; });
+
+    QStringList parts;
+    for (int i = 0; i < entries.size() && i < 12; ++i)
+        parts << QStringLiteral("%1:%2").arg(entries[i].id).arg(entries[i].count);
+    if (entries.size() > 12)
+        parts << QStringLiteral("...");
+    if (overflow > 0)
+        parts << QStringLiteral(">127:%1").arg(overflow);
+
+    return parts.join(QStringLiteral("  "));
 }
 
 quint64 AppMonitor::udpEventsTotal() const

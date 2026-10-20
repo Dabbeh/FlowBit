@@ -38,7 +38,7 @@ int main(int argc, char *argv[])
 
     // 1. monitor never started - the exact case from the screenshot
     {
-        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, false, 0);
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, 0, false, 0);
         const DiagnosticItem i = rowFor(r, QStringLiteral("ETW events received"));
         std::printf("  not running      : %s | %s\n", qPrintable(i.value),
                     qPrintable(i.detail.left(70)));
@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
 
     // 2. running, but only for a few seconds on an idle machine
     {
-        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, true, 5);
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, 0, true, 5);
         const DiagnosticItem i = rowFor(r, QStringLiteral("ETW events received"));
         std::printf("  running 5s       : %s\n", qPrintable(i.detail.left(70)));
         check(i.status == DiagnosticItem::Status::Info, "a few quiet seconds is not a fault");
@@ -60,7 +60,7 @@ int main(int argc, char *argv[])
 
     // 3. running a long time with no events at all - genuinely suspicious
     {
-        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, true, 90);
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 0, 0, 0, true, 90);
         const DiagnosticItem i = rowFor(r, QStringLiteral("ETW events received"));
         std::printf("  running 90s      : %s\n", qPrintable(i.detail.left(70)));
         check(i.status == DiagnosticItem::Status::Warning,
@@ -70,7 +70,7 @@ int main(int argc, char *argv[])
 
     // 4. events arriving but not decoding - a real decoder fault
     {
-        const DiagnosticReport r = collectDiagnostics(true, QString(), 40, 0, true, 30);
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 40, 0, 0, true, 30);
         const DiagnosticItem i = rowFor(r, QStringLiteral("ETW events received"));
         check(i.status == DiagnosticItem::Status::Ok,
               "events arriving is fine even if decoding is reported separately");
@@ -81,11 +81,26 @@ int main(int argc, char *argv[])
 
     // 5. the counter is reported with its context, not as a bare "0 (decoded: 0)"
     {
-        const DiagnosticReport r = collectDiagnostics(true, QString(), 12, 12, true, 45);
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 12, 12, 0, true, 45);
         const DiagnosticItem i = rowFor(r, QStringLiteral("ETW events received"));
         std::printf("  healthy          : %s\n", qPrintable(i.value));
         check(i.value.contains(QStringLiteral("45s")), "the value states how long it has run");
         check(i.status == DiagnosticItem::Status::Ok, "and a working source is OK");
+    }
+
+    // 6. the id report is shown, so the next UDP question is answered by data
+    {
+        const DiagnosticReport r = collectDiagnostics(true, QString(), 500, 500, 40, true, 30,
+                                                      QString(), QString(), QString(), QString(),
+                                                      QStringLiteral("11:400  10:80  43:40"));
+        const DiagnosticItem i = rowFor(r, QStringLiteral("Event ids seen"));
+        std::printf("  ids row          : %s\n", qPrintable(i.value));
+        check(i.value.contains(QStringLiteral("43:40")), "the id report is shown verbatim");
+        check(i.detail.contains(QStringLiteral("42 and 43")),
+              "and explains which ids are the UDP ones");
+        const DiagnosticReport empty = collectDiagnostics(true, QString(), 0, 0, 0, false, 0);
+        check(rowFor(empty, QStringLiteral("Event ids seen")).value == QStringLiteral("none yet"),
+              "with nothing delivered it says so instead of showing an empty cell");
     }
 
     std::printf("\n%d checks, %d failures\n%s\n", g_checks, g_failures,
