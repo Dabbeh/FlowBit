@@ -13,7 +13,9 @@
 // THE RULE NOW
 //
 // Once a single event has arrived, the source is proven for the session and silence can only
-// mean no traffic. The fallback is chosen only while the source has never delivered anything.
+// mean no traffic. Before that, the fallback is chosen only when the machine was actually
+// transferring bytes and ETW still delivered nothing - a quiet connection is not evidence of a
+// broken source.
 //
 // The state cannot be fabricated from a test, so the checks are of the paths, read from the
 // source: the latch exists, the callback sets it, the silence branch is guarded by it, and the
@@ -63,9 +65,13 @@ int main(int argc, char *argv[])
     check(src.contains(QStringLiteral("impl->etwProven = true")),
           "and it is set in the event callback, where delivery is observed");
 
-    // 2. the silence branch can only run while the source has never delivered
-    check(src.contains(QStringLiteral("} else if (!m_impl->etwProven) {")),
+    // 2. the silence branch can only run while the source has never delivered,
+    //    and only when bytes actually moved on the machine
+    check(src.contains(QStringLiteral("} else if (!m_impl->etwProven && systemBusy) {")),
           "the fallback is chosen only while ETW has never delivered anything");
+    check(src.contains(QStringLiteral("quint64 systemByteCount()"))
+              && src.contains(QStringLiteral("GetIfTable2")),
+          "and only when a system-wide traffic sample proves the link was busy");
 
     // 3. recovery still works: events clear the fallback and the tick counter
     check(src.contains(QStringLiteral("m_impl->silentTicks = 0;")),
@@ -100,13 +106,13 @@ int main(int argc, char *argv[])
     // 6. retransmissions do not add bytes. They carry data that was already counted when it was
     //    first sent, and the TCP-counter source counts sequence space rather than wire repeats -
     //    so counting them both inflated usage and made the figure depend on the active source.
-    check(src.contains(QStringLiteral("if (id == kTcpRetransmit || id == kTcpIpv6Retransmit)")),
+    check(src.contains(QStringLiteral("if (kind.retransmit)")),
           "retransmission events are recognised and handled before bytes are recorded");
     {
         // The early return must sit after the liveness latch, or a link carrying only retransmits
         // would look dead to the source check.
         const int latch = src.indexOf(QStringLiteral("impl->etwProven = true"));
-        const int guard = src.indexOf(QStringLiteral("if (id == kTcpRetransmit || id == kTcpIpv6Retransmit)"));
+        const int guard = src.indexOf(QStringLiteral("if (kind.retransmit)"));
         check(latch > 0 && guard > latch,
               "and after the liveness latch, so retransmits still prove the source is alive");
     }

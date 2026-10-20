@@ -2092,7 +2092,12 @@ void MainWindow::buildTray()
     menu->addSeparator();
 
     auto *quitAction = new QAction(QStringLiteral("Quit"), this);
-    connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+    connect(quitAction, &QAction::triggered, this, [this] {
+        // Hide before the destructors run their synchronous teardown, or the window stays
+        // visible and frozen for as long as that takes.
+        hide();
+        QApplication::quit();
+    });
     menu->addAction(quitAction);
 
     m_tray->setContextMenu(menu);
@@ -4102,6 +4107,12 @@ void MainWindow::showEvent(QShowEvent *event)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // Hide first. Everything below can block - the usage flush hits the disk and the ETW
+    // teardown below waits for its consumer thread - and Qt only hides the widget after
+    // closeEvent returns. Without this the window stays on screen, frozen, for that whole
+    // teardown (up to a second waiting for an in-flight monitor start).
+    hide();
+
     // Bank usage on the way out. Even when the app keeps running in the tray, the user may
     // well shut the machine down next, and the periodic checkpoint could be up to 30
     // seconds stale.
@@ -4163,10 +4174,10 @@ void MainWindow::closeEvent(QCloseEvent *event)
         }
     }
 
-    // Release the ETW session and its thread. The window hides rather than exits, so
-    // monitoring is stopped here and restarted when the panel is reopened.
-    if (m_appMonitor)
-        m_appMonitor->stop();
+    // The monitor deliberately keeps running while the window is in the tray. Per-application
+    // usage is banked from its snapshots, and schedules still apply in the background; stopping
+    // it here (as this used to) both lost that usage and cost up to a second of frozen teardown
+    // on the default close path.
 }
 
 } // namespace net

@@ -16,7 +16,9 @@
 #include <QTimer>
 
 #include <winsock2.h>
+#include <ws2ipdef.h>   // netioapi's MIB_IF_* definitions are gated on _WS2IPDEF_
 #include <iphlpapi.h>
+#include <netioapi.h>   // GetIfTable2/MIB_IF_ROW2; iphlpapi only pulls this in for NTDDI >= Vista
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
@@ -90,6 +92,28 @@ constexpr USHORT kTcpIpv6Recv = 27;     // download, IPv6
 constexpr USHORT kTcpIpv6Retransmit = 30;
 
 const wchar_t *kSessionName = L"Flowbit-AppMonitor";
+
+// Total bytes moved by every non-loopback interface.
+//
+// ETW silence only means the source is broken when the machine was actually
+// transferring. Without this witness, an idle minute at startup promoted the TCP
+// fallback and the panel lost UDP/QUIC for the rest of the session.
+quint64 systemByteCount()
+{
+    MIB_IF_TABLE2 *table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || !table)
+        return 0;
+
+    quint64 total = 0;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IF_ROW2 &row = table->Table[i];
+        if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        total += row.InOctets + row.OutOctets;
+    }
+    FreeMibTable(table);
+    return total;
+}
 
 // One network operation, as read out of the event payload.
 struct NetEvent {
@@ -242,6 +266,7 @@ public:
     // scope note, NOT as an error, because nothing is broken.
     QString etwBlockedReason;
     int silentTicks = 0;
+    quint64 lastSystemBytes = 0;   // baseline for systemByteCount(), see tick()
     quint64 lastSeenSample = 0;
 
     // Whether ETW has delivered at least one real event in this session.
@@ -1340,12 +1365,11 @@ bool AppMonitor::Impl::startSession(QString *why)
             if (startRc == ERROR_ACCESS_DENIED) {
                 *why = QStringLiteral(
                     "Flowbit could not start per-application monitoring: access was "
-                    "denied. On this Windows build that almost always means a "
-                    "monitoring session left behind by an earlier run that was "
-                    "closed or crashed while monitoring was active. Run "
-                    "Fix-Monitoring.bat in the Flowbit folder (accept the admin "
-                    "prompt), then press Retry. A restart of the PC also clears "
-                    "any stale session.");
+                    "denied. A leftover monitoring session from an earlier run can cause "
+                    "this, and so can game anti-cheat or security software that blocks new "
+                    "trace sessions (EA AntiCheat is a known case). Restart the PC, close "
+                    "such software, then press Retry. Until then the figures below are "
+                    "TCP-only: UDP and QUIC are not counted.");
             } else if (startRc == ERROR_ALREADY_EXISTS) {
                 // Still blocked after the bounded attempt. The cleanup's own words
                 // matter here: logman reports "Data Collector Set was not found"
@@ -1398,6 +1422,9 @@ bool AppMonitor::Impl::startSession(QString *why)
             *why = QStringLiteral(
                 "Another per-application monitoring handle is already active in "
                 "this process.");
+        // The session was created above; leaving it running would strand a session
+        // that this object no longer has a handle to stop.
+        stopSession();
         return false;
     }
 
@@ -1814,6 +1841,13 @@ bool AppMonitor::start()
     if (state() == MonitorState::Running && !m_starting.load())
         return true;
 
+    // A live session already owns the ETW name. Starting a second one in this process
+    // collides with our own pid-suffixed name, and this build reports that collision as
+    // ACCESS_DENIED - which used to switch a perfectly healthy monitor to the TCP
+    // fallback (and then start a second, nonce-named session that was never stopped).
+    if (m_impl->sessionOwned)
+        return true;
+
     // Without elevation the ETW trace session cannot be created - but that is not
     // the end of monitoring, and treating it as fatal was the second half of the
     // bug that made this feature report "unavailable" while a working source sat
@@ -1957,6 +1991,14 @@ void AppMonitor::tick()
     const bool etwUnavailable = !m_impl->etwBlockedReason.isEmpty();
     if (!etwUnavailable) {
         const quint64 seenNow = m_impl->eventsSeen.load();
+
+        // Traffic witness: the fallback is only fair when the machine was busy and
+        // ETW still said nothing. A quiet connection is not evidence of a broken source.
+        const quint64 sysNow = systemByteCount();
+        const bool systemBusy =
+            m_impl->lastSystemBytes != 0 && sysNow > m_impl->lastSystemBytes;
+        m_impl->lastSystemBytes = sysNow;
+
         if (seenNow != m_impl->lastSeenSample) {
             // Events arrived. ETW is proven for the rest of the session, and anything the
             // fallback was contributing is dropped so the two never double-count.
@@ -1966,11 +2008,9 @@ void AppMonitor::tick()
                 m_impl->useEstats = false;
                 m_impl->connLast.clear();
             }
-        } else if (!m_impl->etwProven) {
-            // Silence, and this source has never delivered anything - only then is it fair to
-            // conclude it does not work on this build. Silence alone is not evidence: an idle
-            // machine sends nothing, and treating that as a fault made the panel accuse ETW of
-            // being broken whenever the connection was quiet.
+        } else if (!m_impl->etwProven && systemBusy) {
+            // Silence while bytes moved: only then is it fair to conclude this source
+            // does not work on this build.
             if (!m_impl->useEstats && ++m_impl->silentTicks >= 3)
                 m_impl->useEstats = true;
         }
