@@ -174,6 +174,16 @@ public:
     QThread *thread = nullptr;
     std::atomic<bool> stopping{false};
 
+    // Result of ProcessTrace() and whether the consumer thread has returned.
+    //
+    // ProcessTrace's return value was DISCARDED, so a consumer that failed immediately left the
+    // session "active" while nothing was ever read from it: Diagnostics showed
+    // "active (this session)", 40s of monitoring, 0 events, and the app had no idea. Capturing the
+    // code is what turns that into something reportable - and recoverable.
+    std::atomic<quint32> consumerExitCode{0};
+    std::atomic<bool> consumerExited{false};
+    std::atomic<int> consumerRestarts{0};
+
     // Counts events so the UI can tell "session running, no traffic" apart from
     // "session running but delivering nothing".
     std::atomic<quint64> eventsSeen{0};
@@ -1389,6 +1399,9 @@ bool AppMonitor::Impl::startSession(QString *why)
         return false;
     }
 
+    consumerExitCode.store(0);
+    consumerExited.store(false);
+
     g_activeConsumer = this;
     traceHandle = OpenTraceW(&logfile);
     if (traceHandle == INVALID_PROCESSTRACE_HANDLE) {
@@ -1404,8 +1417,22 @@ bool AppMonitor::Impl::startSession(QString *why)
 
     // ProcessTrace blocks, so it runs on the monitor thread.
     thread = QThread::create([this] {
-        PROCESS_TRACE_MODE_EVENT_RECORD;
-        ProcessTrace(&traceHandle, 1, nullptr, nullptr);
+        // The stray PROCESS_TRACE_MODE_EVENT_RECORD statement that used to sit here was a no-op
+        // left over from an edit; the mode is set on the logfile, not here.
+        const ULONG rc = ProcessTrace(&traceHandle, 1, nullptr, nullptr);
+
+        consumerExitCode.store(rc);
+        consumerExited.store(true);
+
+        if (!stopping.load()) {
+            // Returned while the session is still wanted: the consumer is gone and every event the
+            // provider sends from now on is discarded by the ETW runtime. Report it, release the
+            // process-wide consumer slot so a restart is allowed, and let tick() rebuild.
+            qWarning("Flowbit: the ETW consumer stopped unexpectedly (ProcessTrace returned %lu)",
+                     static_cast<unsigned long>(rc));
+            if (g_activeConsumer == this)
+                g_activeConsumer = nullptr;
+        }
     });
     thread->start();
 
@@ -1682,6 +1709,18 @@ quint64 AppMonitor::eventsSeenTotal() const
     return m_impl->eventsSeen.load();
 }
 
+QString AppMonitor::consumerReport() const
+{
+    const QString restarts = m_impl->consumerRestarts.load() > 0
+                                 ? QStringLiteral(", %1 restart(s)").arg(m_impl->consumerRestarts.load())
+                                 : QString();
+    if (m_impl->consumerExited.load() && !m_impl->stopping.load())
+        return QStringLiteral("stopped (ProcessTrace %1)%2")
+            .arg(m_impl->consumerExitCode.load()).arg(restarts);
+    return m_impl->consumerExited.load() ? QStringLiteral("stopped") + restarts
+                                         : QStringLiteral("running") + restarts;
+}
+
 QString AppMonitor::eventIdReport() const
 {
     struct Entry {
@@ -1822,6 +1861,23 @@ void AppMonitor::startAsync()
 
 void AppMonitor::tick()
 {
+
+    // Self-recovery: a consumer that returned while the session is still wanted is rebuilt.
+    //
+    // Bounded to two attempts per process; beyond that the state is reported rather than retried
+    // forever, because a provider that refuses every consumer is a fact to surface, not a loop to
+    // run.
+    if (m_impl->consumerExited.load() && !m_impl->stopping.load()
+        && state() == MonitorState::Running) {
+        const int attempts = m_impl->consumerRestarts.load();
+        if (attempts < 2) {
+            m_impl->consumerRestarts.fetch_add(1);
+            qInfo("Flowbit: rebuilding the ETW consumer (attempt %d)", attempts + 1);
+            m_impl->stopSession();               // the consumer thread has already returned
+            startAsync();                        // rebuilds on a worker thread, never on the GUI
+        }
+    }
+
     // With the async start the transitional state is Running before the session
     // settles; ticks during that window only stamp the clock.
     if (state() != MonitorState::Running)

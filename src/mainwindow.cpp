@@ -1523,6 +1523,7 @@ QWidget *MainWindow::buildSettingsPage()
             m_diagnosticsPanel->setRawEvents(m_appMonitor->rawEventReport());
             m_diagnosticsPanel->setRawBits(m_appMonitor->rawBitsReport());
             m_diagnosticsPanel->setEventIds(m_appMonitor->eventIdReport());
+            m_diagnosticsPanel->setConsumerState(m_appMonitor->consumerReport());
             if (m_diagnosticsPanel->isVisible())
                 m_diagnosticsPanel->refresh();
         };

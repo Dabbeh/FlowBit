@@ -309,7 +309,8 @@ QString DiagnosticReport::toText() const
 DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, quint64 udpEvents, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
                                     const QString &rawEvents,
                                     const QString &rawBits,
-    const QString &eventIds)
+    const QString &eventIds,
+    const QString &consumerState)
 {
     DiagnosticReport r;
     const auto add = [&r](const QString &group, const QString &name, const QString &value,
@@ -570,6 +571,23 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
                 : QStringLiteral("No UDP events in this session. UDP is counted through the same "
                                  "ETW source as TCP; the TCP-counter fallback cannot see it. If "
                                  "UDP traffic is flowing, send the saved report."));
+
+        // The consumer thread, separately from the session.
+        //
+        // A session can be "active" while its consumer has already returned - then the provider
+        // keeps sending and nothing reads it, which reads as a healthy session with zero events.
+        // That is precisely the state this row exists to name.
+        add(QStringLiteral("Monitoring"), QStringLiteral("ETW consumer"),
+            consumerState.isEmpty() ? QStringLiteral("unknown") : consumerState,
+            consumerState.startsWith(QStringLiteral("stopped"))
+                ? DiagnosticItem::Status::Warning
+                : DiagnosticItem::Status::Ok,
+            consumerState.startsWith(QStringLiteral("stopped"))
+                ? QStringLiteral("The thread that reads events has returned while the session is "
+                                 "still active, so no events are being counted. ProcessTrace's "
+                                 "return code is shown; Flowbit rebuilds the consumer up to twice "
+                                 "per run and reports the restarts.")
+                : QStringLiteral("The thread that reads the provider's events is running."));
 
         // Which ids the provider actually delivers.
         //

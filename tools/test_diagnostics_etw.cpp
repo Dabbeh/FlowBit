@@ -103,6 +103,23 @@ int main(int argc, char *argv[])
               "with nothing delivered it says so instead of showing an empty cell");
     }
 
+    // 7. a dead consumer is named, because an active session with zero events is the confusing case
+    {
+        const DiagnosticReport dead = collectDiagnostics(
+            true, QString(), 0, 0, 0, true, 40, QString(), QString(), QString(), QString(),
+            QStringLiteral("none yet"), QStringLiteral("stopped (ProcessTrace 87), 1 restart(s)"));
+        const DiagnosticItem i = rowFor(dead, QStringLiteral("ETW consumer"));
+        std::printf("  consumer row     : %s\n", qPrintable(i.value));
+        check(i.status == DiagnosticItem::Status::Warning, "a stopped consumer is a warning");
+        check(i.value.contains(QStringLiteral("87")), "and its error code is shown");
+
+        const DiagnosticReport alive = collectDiagnostics(
+            true, QString(), 0, 0, 0, true, 40, QString(), QString(), QString(), QString(),
+            QStringLiteral("none yet"), QStringLiteral("running"));
+        check(rowFor(alive, QStringLiteral("ETW consumer")).status == DiagnosticItem::Status::Ok,
+              "a running consumer is OK");
+    }
+
     std::printf("\n%d checks, %d failures\n%s\n", g_checks, g_failures,
                 g_failures == 0 ? "test_diagnostics_etw passed." : "FAILED.");
     return g_failures == 0 ? 0 : 1;

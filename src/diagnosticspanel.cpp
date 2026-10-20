@@ -185,6 +185,11 @@ void DiagnosticsPanel::setMonitorTelemetry(quint64 seen, quint64 decoded, quint6
     m_monitorSeconds = monitorSeconds;
 }
 
+void DiagnosticsPanel::setConsumerState(const QString &state)
+{
+    m_consumerState = state;
+}
+
 void DiagnosticsPanel::setEventIds(const QString &ids)
 {
     m_eventIds = ids;
@@ -219,7 +224,7 @@ void DiagnosticsPanel::refresh()
 {
     m_report = collectDiagnostics(processIsElevated(), m_monitorError, m_seen, m_decoded, m_udp,
                                   m_monitorRunning, m_monitorSeconds, m_eventLayout, m_addressMiss,
-                                  m_rawEvents, m_rawBits, m_eventIds);
+                                  m_rawEvents, m_rawBits, m_eventIds, m_consumerState);
     buildRows();
 }
 

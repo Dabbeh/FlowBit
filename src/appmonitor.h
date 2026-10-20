@@ -128,6 +128,10 @@ public:
     // Which event ids the provider is actually delivering, as "id:count" pairs.
     QString eventIdReport() const;
 
+    // State of the ETW consumer thread: "running", or how it stopped.
+    // A session can be active while its consumer is dead, which reads as zero events.
+    QString consumerReport() const;
+
     // True while the panel is being fed from the TCP EStats fallback instead of
     // ETW (some Windows builds deliver zero kernel-network events). TCP-only is
     // the trade: QUIC/UDP traffic is not attributed until ETW recovers, so the
