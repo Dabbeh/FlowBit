@@ -1776,6 +1776,23 @@ void AppMonitor::tick()
     emit updated();
 }
 
+void AppMonitor::stopAsync()
+{
+    // Coalesced like startAsync: pressing Show More repeatedly must not spawn one teardown per
+    // press.
+    bool expected = false;
+    if (!m_stopping.compare_exchange_strong(expected, true))
+        return;
+
+    QThread *t = QThread::create([this] {
+        stop();
+        m_stopping.store(false);
+        QMetaObject::invokeMethod(this, [this] { emit stateChanged(); }, Qt::QueuedConnection);
+    });
+    connect(t, &QThread::finished, t, &QThread::deleteLater);
+    t->start();
+}
+
 void AppMonitor::stop()
 {
     if (state() == MonitorState::Stopped)

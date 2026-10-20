@@ -1,5 +1,7 @@
 #include "mainwindow.h"
 
+#include <QThread>
+
 #include "appactivitypanel.h"
 #include "diagnosticspanel.h"
 #include "applimitengine.h"
@@ -864,10 +866,12 @@ QWidget *MainWindow::buildDashboardPage()
             // The viewport never moved during the reveal; nothing to correct and
             // no post-glide on expand.
         } else {
-            QWidget *canvas = m_dashScroll->widget();
-            if (!canvas || !m_showMoreButton)
+            // Named distinctly from the outer `canvas` in this scope: shadowing it made the two
+            // easy to confuse, and -Wshadow flags it.
+            QWidget *dashboardCanvas = m_dashScroll->widget();
+            if (!dashboardCanvas || !m_showMoreButton)
                 return;
-            const int toggleY = m_showMoreButton->mapTo(canvas, QPoint(0, 0)).y();
+            const int toggleY = m_showMoreButton->mapTo(dashboardCanvas, QPoint(0, 0)).y();
             if (toggleY >= bar->value())
                 return;   // still visible: nothing to do
             glideDashboardScrollTo(qMax(0, toggleY - 12), 240);
@@ -3651,8 +3655,35 @@ void MainWindow::applyStartupSetting()
         return;
 
     const Settings s = m_store->load();
-    QString error;
-    const bool ok = autostart::setEnabled(s.startWithWindows, &error);
+
+    // The registration itself runs on a worker thread.
+    //
+    // setEnabled() shells out to schtasks.exe and waits up to twenty seconds for it. On the GUI
+    // thread that is a twenty-second freeze for a checkbox - and Qt's own QProcess documentation
+    // is explicit that waitForFinished() blocks the calling thread. This mirrors what
+    // AppMonitor::startAsync() already does for its own slow, external work.
+    if (m_startupApplying) {
+        m_startupPending = true;
+        return;
+    }
+    m_startupApplying = true;
+    m_startupPending = false;
+
+    const bool want = s.startWithWindows;
+    QThread *worker = QThread::create([this, want] {
+        QString error;
+        const bool ok = autostart::setEnabled(want, &error);
+        QMetaObject::invokeMethod(
+            this, [this, ok, error] { onStartupSettingApplied(ok, error); },
+            Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QThread::deleteLater);
+    worker->start();
+}
+
+void MainWindow::onStartupSettingApplied(bool ok, const QString &error)
+{
+    m_startupApplying = false;
 
     // A task usually creates fine; when policy or permissions forbid one, setEnabled falls back
     // to the Run key and reports that with this marker. The fallback still starts Flowbit, so
@@ -3685,6 +3716,12 @@ void MainWindow::applyStartupSetting()
     }
 
     refreshStartupNote();
+
+    // Replay a request that arrived while this one was running.
+    if (m_startupPending) {
+        m_startupPending = false;
+        applyStartupSetting();
+    }
 }
 
 void MainWindow::refreshStartupNote()

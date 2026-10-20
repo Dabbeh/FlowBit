@@ -272,8 +272,6 @@ RepairOutcome repairDisabledDriverService()
     if (!scm)
         return RepairOutcome::Refused;
 
-    RepairOutcome outcome = RepairOutcome::Refused;
-
     // Both rights are requested in one open: the start type is changed and the service is then
     // stopped, and asking twice would be a needless extra SCM round trip.
     if (SC_HANDLE svc = OpenServiceW(
@@ -291,14 +289,14 @@ RepairOutcome repairDisabledDriverService()
                                  SERVICE_NO_CHANGE, nullptr, nullptr, nullptr, nullptr,
                                  nullptr, nullptr, nullptr);
 
-        if (startTypeChanged) {
-            outcome = RepairOutcome::Repaired;
-        } else if (GetLastError() == ERROR_SERVICE_MARKED_FOR_DELETE) {
-            // Pending deletion, so the configuration cannot be altered - Windows will not let
-            // anything change a service that is on its way out. The stop can still be attempted,
-            // and the stop is what actually matters here.
-            outcome = RepairOutcome::Repaired;
-        } else {
+        // Pending deletion means the configuration cannot be altered - Windows will not let
+        // anything change a service on its way out - but the service is still usable, so that is
+        // not a refusal either. Only an error that is neither is fatal here.
+        //
+        // The result is deliberately not remembered in a variable: this function decides from the
+        // service state it reads back afterwards, because those two can disagree. An unused
+        // variable suggesting otherwise was exactly the confusion this comment removes.
+        if (!startTypeChanged && GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE) {
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
             return RepairOutcome::Refused;

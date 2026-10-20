@@ -220,7 +220,6 @@ void applyApplicationTheme()
 
     // Palette so native widgets (menus, tooltips, spin boxes) follow the theme.
     QPalette pal;
-    const bool dark = g_dark;
     pal.setColor(QPalette::Window, kBackground());
     pal.setColor(QPalette::WindowText, kTextPrimary());
     pal.setColor(QPalette::Base, kPanelSunken());

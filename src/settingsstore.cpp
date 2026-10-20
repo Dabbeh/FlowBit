@@ -254,7 +254,19 @@ int SettingsStore::migrateLegacyData() const
         // The legacy files stay in place: if the user downgrades, the old build
         // must still find its data. This is a copy, not a move.
         if (QFile::copy(from, to)) {
-            QFile::setPermissions(to, QFile::ReadOwner | QFile::WriteOwner);
+            // Restricting the copy is part of copying it: these files hold installed paths,
+            // per-application limits and schedule times, and an inherited ACL can leave them
+            // readable by every user on the machine. A failure here is worth acting on rather
+            // than assuming, because the old location may have had looser permissions than the
+            // new one expects.
+            if (!QFile::setPermissions(to, QFile::ReadOwner | QFile::WriteOwner)) {
+                qWarning("Flowbit: migrated %s but could not restrict its permissions",
+                         qPrintable(QFileInfo(to).fileName()));
+                // Remove the unprotected copy rather than leaving private data readable: the
+                // legacy file is untouched, so nothing is lost.
+                QFile::remove(to);
+                continue;
+            }
             ++copied;
         }
     }

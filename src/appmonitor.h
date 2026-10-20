@@ -88,6 +88,14 @@ public:
 
     void stop();
 
+    // Same teardown as stop(), on a worker thread.
+    //
+    // stop() can spin for up to a second waiting on an in-flight start and then stops the trace
+    // session. The activity panel calls it every time it collapses, from a deferred lambda on the
+    // GUI thread - so collapsing the panel could freeze the window. Nothing about the teardown
+    // needs the GUI thread.
+    void stopAsync();
+
     MonitorState state() const { return m_state.load(); }
     bool isRunning() const { return state() == MonitorState::Running; }
 
@@ -202,6 +210,7 @@ private:
 
     std::atomic<MonitorState> m_state{MonitorState::Stopped};
     std::atomic<bool> m_starting{false};   // startAsync worker in flight
+    std::atomic<bool> m_stopping{false};   // stopAsync worker in flight
     // Interval bookkeeping for tick()-driven snapshots (owned by the GUI thread).
     std::chrono::steady_clock::time_point m_lastTick{};
     int m_tickCount = 0;

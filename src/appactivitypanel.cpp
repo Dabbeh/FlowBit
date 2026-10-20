@@ -311,7 +311,7 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
                 m_stopMonitorWhenCollapsed = false;
                 QTimer::singleShot(0, this, [this] {
                     if (m_monitor && !m_expanded && m_monitor->isRunning())
-                        m_monitor->stop();
+                        m_monitor->stopAsync();
                 });
             }
         } else {
@@ -514,7 +514,7 @@ void AppActivityPanel::setExpanded(bool expanded)
                 m_stopMonitorWhenCollapsed = true;
             } else {
                 // No animation in flight: safe to stop immediately.
-                m_monitor->stop();
+                m_monitor->stopAsync();
                 m_stopMonitorWhenCollapsed = false;
             }
         }
