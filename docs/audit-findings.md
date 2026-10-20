@@ -336,9 +336,54 @@ file on disk once the path is usable.
 | F10 ETW handle closed under ProcessTrace, running QThread deleted | HIGH | fixed, tested |
 | F11 failed settings saves reported as success | MEDIUM | fixed, tested |
 | F12 failed history writes never retried | MEDIUM | fixed, tested |
+| F13 diagnostics reported a stopped monitor as a broken ETW source | MEDIUM | fixed, tested |
 
 Verification: 0 compiler warnings across all sources; nine suites, **780 checks, 0 failures, no
 empty suites**; eight standalone suites (62 additional checks) covering every fix in this document.
+
+---
+
+
+---
+
+# F13 — Diagnostics called a healthy machine broken
+
+Reported after installing everything above, with a screenshot: Diagnostics showed
+
+```
+!  ETW events received    0 (decoded: 0)
+   The kernel network provider is delivering no events on this Windows build...
+```
+
+**It was a false alarm, and the evidence was on the same machine.** Flowbit had been running for
+about two minutes; `logman query -ets` showed **no Flowbit trace session at all**. The monitor is
+what creates the session, and the monitor starts when the Activity Network panel is opened - which
+it had not been. Zero events was the only possible answer, on a machine where ETW had been measured
+delivering 385 events earlier.
+
+The row treated `eventsSeen == 0` as a Warning unconditionally. The `monitorRunning` flag was
+already being passed into `collectDiagnostics()` and used by two neighbouring rows - this row simply
+ignored it.
+
+This is the **third** instance of the same mistake in this project: the panel note (fixed earlier),
+and now the diagnostics row. The lesson that keeps being relearned is that *absence of measurement
+is not evidence of breakage* - and that a zero needs its context printed next to it.
+
+The row now distinguishes four states, each with its own severity:
+
+| State | Severity | Message |
+|---|---|---|
+| Monitor not running | Info | "The monitor is not running, so nothing is being traced. Open Application Network Activity to start it." |
+| Running < 15s, no events | Info | "Monitoring has been running for Ns and nothing has transferred in that time" |
+| Running >= 15s, no events | Warning | The original warning, now naming the duration |
+| Events arrive, none decode | Problem (unchanged) | The decoder does not match this build |
+
+The value column also carries the duration, so "0 (decoded: 0), 45s" cannot be mistaken for
+"0 (decoded: 0)" from something that just started.
+
+`test_diagnostics_etw` drives `collectDiagnostics()` directly through all four states - it is a pure
+function of its inputs, so this is a real behavioural test rather than a source check (10 checks).
+`run_diag_tests` still passes (36 checks).
 
 ---
 

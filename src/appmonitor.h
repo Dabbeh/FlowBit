@@ -104,6 +104,12 @@ public:
     // claiming "nothing is using the network".
     bool isStarting() const { return m_starting.load(); }
 
+    // Seconds of monitoring in this session (one tick per second, reset on start).
+    //
+    // Needed by diagnostics to tell "the source is broken" from "the panel was never opened" and
+    // from "nothing has transferred yet" - three states that all read as zero events.
+    int runningSeconds() const { return m_tickCount; }
+
     // Human-readable reason for the current Unavailable state, or empty.
     QString errorString() const;
 

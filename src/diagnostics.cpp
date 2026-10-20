@@ -306,7 +306,7 @@ QString DiagnosticReport::toText() const
     return out;
 }
 
-DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, bool monitorRunning, const QString &eventLayout, const QString &addressMiss,
+DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
                                     const QString &rawEvents,
                                     const QString &rawBits)
 {
@@ -514,18 +514,46 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
 
         // ETW delivery counters: the pair separates 'provider silent' from
         // 'payload schema changed' - entirely different fixes.
+        // Zero events means four different things, and only one of them is a fault.
+        //
+        // This row used to report a zero as a WARNING unconditionally: "the kernel network
+        // provider is delivering no events on this Windows build". That was shown on every launch
+        // where the activity panel had not been opened - because the monitor is what starts the
+        // trace session, and with no session there are no events by definition. A user reading it
+        // saw a fault on a perfectly healthy machine, which is the same mistake the activity panel
+        // made before it learned to distinguish silence from breakage.
+        //
+        //   monitor never started   -> nothing is wrong; say how to start it
+        //   running, no traffic yet -> normal on an idle machine for the first seconds
+        //   running a while, still 0 -> genuinely suspicious: warn, with the duration
+        //   events but none decoded -> the decoder does not match this build: a problem
+        const bool noEvents = eventsSeen == 0;
+        const QString monitorState =
+            !monitorRunning
+                ? QStringLiteral("The monitor is not running, so nothing is being traced. Open "
+                                 "Application Network Activity to start it; this row then counts "
+                                 "what arrives.")
+                : (noEvents && monitorSeconds < 15
+                       ? QStringLiteral("Monitoring has been running for %1s and nothing has "
+                                        "transferred in that time, so there is nothing to count "
+                                        "yet.").arg(monitorSeconds)
+                       : (noEvents
+                              ? QStringLiteral("Monitoring has been running for %1s and the kernel "
+                                               "network provider has delivered no events. Send "
+                                               "the saved report - the decoder may need this "
+                                               "build's schema.").arg(monitorSeconds)
+                              : QString()));
+
         add(QStringLiteral("Monitoring"), QStringLiteral("ETW events received"),
-            QStringLiteral("%1 (decoded: %2)").arg(eventsSeen).arg(eventsDecoded),
-            eventsSeen == 0
-                ? DiagnosticItem::Status::Warning
-                : DiagnosticItem::Status::Ok,
-            eventsSeen == 0
-                ? QStringLiteral("The kernel network provider is delivering no "
-                                  "events on this Windows build. Attempting a new "
-                                  "session with the full keyword mask may help; if it "
-                                  "persists, send the saved report - the decoder needs "
-                                  "this build's schema.")
-                : QString());
+            monitorRunning ? QStringLiteral("%1 (decoded: %2), %3s")
+                                 .arg(eventsSeen).arg(eventsDecoded).arg(monitorSeconds)
+                           : QStringLiteral("%1 (decoded: %2), monitor not running")
+                                 .arg(eventsSeen).arg(eventsDecoded),
+            !monitorRunning                                 ? DiagnosticItem::Status::Info
+            : (noEvents && monitorSeconds < 15)             ? DiagnosticItem::Status::Info
+            : noEvents                                      ? DiagnosticItem::Status::Warning
+                                                            : DiagnosticItem::Status::Ok,
+            monitorState);
 
         // Phase 0.1 evidence: raw address bits and the local address list.
         // Placed first in MONITORING because it is what the direction fix is

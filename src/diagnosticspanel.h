@@ -36,7 +36,7 @@ public:
     void setMonitorError(const QString &error);
 
     // Forwards the monitor's ETW counters into the report (received vs decoded).
-    void setMonitorTelemetry(quint64 seen, quint64 decoded);
+    void setMonitorTelemetry(quint64 seen, quint64 decoded, int monitorSeconds);
     void setMonitorRunning(bool running);
     void setEventLayout(const QString &layout);
     void setAddressMiss(const QString &text);
@@ -59,6 +59,7 @@ private:
     DiagnosticReport m_report;
     QString m_monitorError;
     quint64 m_seen = 0;
+    int m_monitorSeconds = 0;
     quint64 m_decoded = 0;
     bool m_monitorRunning = false;
     QString m_eventLayout;
