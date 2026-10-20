@@ -211,15 +211,13 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
     if (path.isEmpty() || (downBytes == 0 && upBytes == 0))
         return;
 
-    // Roll the date if the app has been running past midnight, so a sample cannot
-    // be charged to the previous day.
-    const QDate today = QDate::currentDate();
-    if (today != m_today) {
-        flush();
-        m_today = today;
-        m_liveDown = 0;
-        m_liveUp = 0;
-    }
+    rollOverDay();
+
+    // A single interval cannot legitimately exceed this. Anything larger is a
+    // driver-level counter jump, and admitting it corrupts the stored history.
+    constexpr quint64 kMaxSampleBytes = 64ull * 1024ull * 1024ull * 1024ull;   // 64 GiB
+    if (downBytes > kMaxSampleBytes || upBytes > kMaxSampleBytes)
+        return;
 
     const QString key = m_today.toString(Qt::ISODate);
     AppUsage &u = m_appDays[key][path];
@@ -227,43 +225,12 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
         u.path = path;
     if (!name.isEmpty())
         u.name = name;      // refresh the display name as it is seen
-    // downBytes/upBytes are CUMULATIVE counters for this executable, not a delta.
-    //
-    // The previous code added them straight onto the running total, so every tick charged the
-    // whole history again. On a real machine that drove one entry to 8.6e18 bytes - just under
-    // 2^64, where the arithmetic wraps - and the Statistics page showed ~139 TB for a service
-    // host. Steam's row looked almost normal only because its cumulative total is small.
-    const QPair<quint64, quint64> previous = m_lastAppBytes.value(path, qMakePair<quint64, quint64>(0, 0));
-    quint64 dDown = 0;
-    quint64 dUp = 0;
 
-    if (downBytes >= previous.first)
-        dDown = downBytes - previous.first;
-    else
-        dDown = downBytes;      // counters restarted (monitor restarted): count what has accumulated
-
-    if (upBytes >= previous.second)
-        dUp = upBytes - previous.second;
-    else
-        dUp = upBytes;
-
-    // Bounded: one entry per executable ever seen, across every restart, was unbounded. A machine
-    // that runs a lot of short-lived tools (installers, updaters, portable apps) accumulates them
-    // for the life of the process. Clearing wholesale is safe - the next sample for each path simply
-    // becomes its own baseline, which costs at most one interval of accuracy for paths not seen since
-    // the clear.
-    if (m_lastAppBytes.size() > 512 && !m_lastAppBytes.contains(path))
-        m_lastAppBytes.clear();
-    m_lastAppBytes.insert(path, qMakePair(downBytes, upBytes));
-
-    // A single sample cannot legitimately exceed this. Anything larger is a restart artefact or a
-    // driver-level counter jump, and admitting it corrupts the stored history permanently.
-    constexpr quint64 kMaxSampleBytes = 64ull * 1024ull * 1024ull * 1024ull;   // 64 GiB
-    if (dDown > kMaxSampleBytes || dUp > kMaxSampleBytes)
-        return;
-
-    u.down += dDown;
-    u.up += dUp;
+    // The caller passes the bytes measured during this interval, not a lifetime
+    // counter. Adding them is the whole contract; differencing them here charged
+    // steady traffic as zero and rising traffic as only its increase.
+    u.down += downBytes;
+    u.up += upBytes;
     m_appDaysDirty.insert(key.left(7));   // yyyy-MM
 }
 
@@ -456,18 +423,26 @@ bool UsageTracker::storeMonth(const QDate &month)
     return true;
 }
 
-void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
+void UsageTracker::rollOverDay()
 {
-    if (downBytes == 0 && upBytes == 0)
+    const QDate now = QDate::currentDate();
+    if (now == m_today)
         return;
 
-    const QDate now = QDate::currentDate();
-    if (now != m_today) {
-        // Midnight rollover: bank the previous day before attributing anything
-        // to the new one.
-        flush();
-        m_today = now;
-    }
+    // Bank the previous day before attributing anything to the new one. The live
+    // counters are cycle totals, not day totals, so they are deliberately kept.
+    flush();
+    m_today = now;
+}
+
+void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
+{
+    // Before the zero check: an idle machine still has to cross midnight, or the
+    // first sample tomorrow is charged to yesterday.
+    rollOverDay();
+
+    if (downBytes == 0 && upBytes == 0)
+        return;
 
     m_liveDown += downBytes;
     m_liveUp += upBytes;
@@ -595,17 +570,47 @@ void UsageTracker::resetCurrentCycle(const UsageConfig &config)
     // Clear only the days inside the active cycle - older history stays intact.
     for (QDate d = start; d <= today; d = d.addDays(1)) {
         const QString k = keyFor(d);
+        const QString month = d.toString(QStringLiteral("yyyy-MM"));
         if (m_days.contains(k)) {
             m_days[k].down = 0;
             m_days[k].up = 0;
-            m_dirtyMonths.insert(d.toString(QStringLiteral("yyyy-MM")));
+            m_dirtyMonths.insert(month);
         }
+        // The per-application table is the same cycle, so leaving it behind made
+        // the reset look partial and inflated the table's share of the new total.
+        if (m_appDays.remove(k) > 0)
+            m_appDaysDirty.insert(month);
     }
 
     m_liveDown = m_liveUp = 0;
     flush();
 
     emit usageChanged();
+}
+
+int UsageTracker::resetAllUsage()
+{
+    m_days.clear();
+    m_appDays.clear();
+    m_dirtyMonths.clear();
+    m_appDaysDirty.clear();
+    m_liveDown = m_liveUp = 0;
+    m_today = QDate::currentDate();
+
+    // Delete the persisted months too; clearing memory alone would restore the
+    // old figures on the next launch.
+    int failed = 0;
+    QDir dir(m_dir);
+    const QStringList files =
+        dir.entryList({QStringLiteral("usage-*.json"), QStringLiteral("apps-*.json")},
+                      QDir::Files);
+    for (const QString &name : files) {
+        if (!dir.remove(name))
+            ++failed;
+    }
+
+    emit usageChanged();
+    return failed;
 }
 
 } // namespace net

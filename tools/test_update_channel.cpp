@@ -13,9 +13,11 @@
 #include "updater.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
+#include <QTemporaryDir>
 #include <QTimer>
 
 #include <cstdio>
@@ -26,6 +28,19 @@ namespace {
 
 int g_checks = 0;
 int g_failures = 0;
+
+// The test binary may live in a build directory several levels below the repo.
+QString repoFile(const QString &relative)
+{
+    QDir dir(QCoreApplication::applicationDirPath());
+    for (int i = 0; i < 8; ++i) {
+        if (QFile::exists(dir.filePath(relative)))
+            return dir.filePath(relative);
+        if (!dir.cdUp())
+            break;
+    }
+    return relative;
+}
 
 void check(bool ok, const QString &what)
 {
@@ -87,19 +102,23 @@ int main(int argc, char *argv[])
     QCoreApplication app(argc, argv);
     QCoreApplication::setApplicationVersion(QStringLiteral("1.0.0"));
 
+    QTemporaryDir tmp;
+    check(tmp.isValid(), "a temporary directory is available for test version files");
+
     std::printf("\n== the version file, as the application reads it ==\n");
     std::printf("  url: %s\n", qPrintable(Updater::versionFileUrl()));
 
     // ---- 1. the committed file parses ------------------------------------
     // Read from disk first, so the parsing is checked without depending on the network.
     {
-        QFile f(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/docs/version.json"));
+        QFile f(repoFile(QStringLiteral("docs/version.json")));
         check(f.exists(), "docs/version.json exists in the repository");
         if (f.open(QIODevice::ReadOnly)) {
             const QByteArray body = f.readAll();
             std::printf("  contents: %s\n", body.simplified().constData());
             check(body.contains("\"version\""), "it declares a version");
             check(body.contains("\"url\""), "and a download address");
+            check(body.contains("\"sha256\""), "and a checksum for the offered executable");
         }
     }
 
@@ -137,12 +156,13 @@ int main(int argc, char *argv[])
     // so a higher version can be presented without publishing anything.
     {
         std::printf("\n== a newer version ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/newer.json");
+        const QString path = tmp.filePath(QStringLiteral("newer.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"9.9.9\",\n"
                     "  \"url\": \"https://example.invalid/Flowbit.exe\",\n"
+                    "  \"sha256\": "
+                    "\"0000000000000000000000000000000000000000000000000000000000000000\",\n"
                     "  \"notes\": \"a test release\"\n}\n");
             f.close();
         }
@@ -162,8 +182,7 @@ int main(int argc, char *argv[])
     // ---- 4. an OLDER version is not offered -------------------------------
     {
         std::printf("\n== an older version ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/older.json");
+        const QString path = tmp.filePath(QStringLiteral("older.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"0.1.0\",\n  \"url\": \"https://example.invalid/x\"\n}\n");
@@ -181,8 +200,7 @@ int main(int argc, char *argv[])
     // ---- 5. a malformed file is reported, not ignored --------------------
     {
         std::printf("\n== a malformed file ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/broken.json");
+        const QString path = tmp.filePath(QStringLiteral("broken.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{ this is not json");
@@ -200,8 +218,7 @@ int main(int argc, char *argv[])
     // ---- 6. a file missing its fields is refused -------------------------
     {
         std::printf("\n== a file with no download address ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/nourl.json");
+        const QString path = tmp.filePath(QStringLiteral("nourl.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"2.0.0\"\n}\n");

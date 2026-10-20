@@ -87,7 +87,7 @@ public:
         QVector<AppUsage> apps;
     };
 
-    // Records one interval's bytes for an application. Called once per sampled
+    // Records one interval's bytes for an application. Called once per completed
     // interval per application, so it must stay cheap: it only adds to maps.
     void addAppSample(const QString &path, const QString &name,
                       quint64 downBytes, quint64 upBytes);
@@ -106,6 +106,10 @@ public:
     // Clears usage for the current cycle only.
     void resetCurrentCycle(const UsageConfig &config);
 
+    // Deletes every recorded usage and per-application entry, in memory and on
+    // disk. Returns the number of files that could not be removed.
+    int resetAllUsage();
+
 signals:
     // Emitted after totals change, so the UI can repaint without polling.
     void usageChanged();
@@ -115,6 +119,10 @@ private:
     QString fileForMonth(const QDate &month) const;
     void loadMonth(const QDate &month);
     bool storeMonth(const QDate &month);
+
+    // Banks the previous day and points the tracker at the new one. Called
+    // before either add path, so a zero-byte sample at midnight still rolls.
+    void rollOverDay();
 
     // Per-app history, stored in its own file per month.
     void loadAppsMonth(const QDate &month);
@@ -132,13 +140,6 @@ private:
     // tick, which is where this is written.
     QHash<QString, QHash<QString, AppUsage>> m_appDays;   // day ISO -> path -> usage
     QSet<QString> m_appDaysDirty;                         // months needing a write
-
-    // Last cumulative counters seen per executable, so a sample can be turned into a delta.
-    //
-    // The monitor reports CUMULATIVE bytes per application. Adding that number to a running total
-    // on every tick charges the whole history again each second, which is how one entry reached
-    // 8.6 quintillion bytes on a real machine - close to 2^64, where unsigned arithmetic wraps.
-    QHash<QString, QPair<quint64, quint64>> m_lastAppBytes;
 
     quint64 m_liveDown = 0;
     quint64 m_liveUp = 0;

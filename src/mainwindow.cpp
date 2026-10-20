@@ -118,6 +118,25 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
     // so a user who never opens it pays no cost. The monitor owns its own thread.
     m_appMonitor = new AppMonitor(this);
 
+    // Record per-app usage exactly once per completed interval.
+    //
+    // The snapshot's byte counts are per interval, not lifetime counters, and a
+    // tick that is skipped (during the panel animation) must not feed the same
+    // snapshot twice. updated() is emitted once at the end of every completed
+    // interval, which is precisely the unit addAppSample expects.
+    connect(m_appMonitor, &AppMonitor::updated, this, [this] {
+        const QVector<AppTraffic> apps = m_appMonitor->snapshot();
+        for (const AppTraffic &a : apps) {
+            const QString path = a.executablePath.isEmpty() ? a.executableName
+                                                            : a.executablePath;
+            if (path.isEmpty())
+                continue;
+            m_usage->addAppSample(path,
+                                  a.displayName.isEmpty() ? a.executableName : a.displayName,
+                                  a.bytesIn, a.bytesOut);
+        }
+    });
+
     // Per-application limiting. Also created up front and started only once the
     // user has rules, so a machine with none never pays for the driver handles.
     m_appLimitEngine = new AppLimitEngine(this);
@@ -1171,12 +1190,45 @@ QWidget *MainWindow::buildStatisticsPage()
         QFrame *card = makeCard(QStringLiteral("Cycle Controls"), body);
         auto *cl = qobject_cast<QVBoxLayout *>(card->layout());
         auto *note = new QLabel(
-            QStringLiteral("The quota, cycle length and reset buttons are on the Dashboard, "
-                           "so both views act on the same recorded usage."),
+            QStringLiteral("The quota and cycle length are set on the Dashboard. Resetting "
+                           "usage here changes no settings, limits or schedules."),
             card);
         note->setObjectName(QStringLiteral("sub"));
         note->setWordWrap(true);
         cl->addWidget(note);
+
+        auto *row = new QHBoxLayout();
+        row->setSpacing(10);
+        row->addStretch(1);
+
+        auto *resetUsage = new QPushButton(QStringLiteral("Reset usage statistics"), card);
+        resetUsage->setObjectName(QStringLiteral("danger"));
+        resetUsage->setCursor(Qt::PointingHandCursor);
+        resetUsage->setToolTip(QStringLiteral(
+            "Deletes all recorded usage and the per-application history."));
+        connect(resetUsage, &QPushButton::clicked, this, [this] {
+            const auto answer = QMessageBox::question(
+                this, QStringLiteral("Reset usage statistics"),
+                QStringLiteral("Delete every recorded usage total and the per-application "
+                               "history?\n\nYour settings, limits and schedules are kept."),
+                QMessageBox::Reset | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (answer != QMessageBox::Reset)
+                return;
+
+            const int failed = m_usage->resetAllUsage();
+            refreshUsage();
+            refreshStatistics();
+            if (failed > 0) {
+                QMessageBox::warning(
+                    this, QStringLiteral("Reset usage statistics"),
+                    QStringLiteral("%1 usage file(s) could not be deleted, so old figures may "
+                                   "return after a restart.").arg(failed));
+            } else {
+                statusBar()->showMessage(QStringLiteral("Usage statistics cleared"), 4000);
+            }
+        });
+        row->addWidget(resetUsage);
+        cl->addLayout(row);
 
         auto *go = new QPushButton(QStringLiteral("Open Usage Controls"), card);
         go->setObjectName(QStringLiteral("ghost"));
@@ -2068,6 +2120,30 @@ void MainWindow::buildTray()
     // The updater lives as long as the window. It is created here rather than inside the
     // settings page so a check can also be started at launch.
     m_updater = new Updater(this);
+
+    // Connected once, not per check: a second check used to stack another pair of
+    // handlers, so a deferral restarted the snooze timer several times.
+    connect(m_updater, &Updater::updateSkipped, this, [this](const QString &version) {
+        Settings s = m_store->load();
+        s.skippedVersion = version;
+        persistSettings(s, QStringLiteral("your settings"));
+        setUpdateStatus(QStringLiteral("Version %1 skipped. A newer version will be offered.")
+                            .arg(version),
+                        false);
+    });
+    connect(m_updater, &Updater::updateDeferred, this, [this](const QString &version) {
+        setUpdateStatus(QStringLiteral("Update %1 postponed. It will be offered again.")
+                            .arg(version),
+                        false);
+
+        if (!m_updateSnooze) {
+            m_updateSnooze = new QTimer(this);
+            m_updateSnooze->setSingleShot(true);
+            m_updateSnooze->setInterval(kUpdateSnoozeMs);
+            connect(m_updateSnooze, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
+        }
+        m_updateSnooze->start();
+    });
 
     m_tray = new QSystemTrayIcon(this);
     updateTrayIcon(false);
@@ -3317,29 +3393,6 @@ void MainWindow::onThroughput(double downBps, double upBps)
     // SpeedMonitor samples once per second, so one second of traffic at N
     // bytes/sec is exactly N bytes of usage.
     m_usage->addSample(downBps, upBps);
-
-    // Per-application usage history, recorded from the same tick.
-    //
-    // The monitor already attributes bytes to applications for the live panel, and
-    // those bytes are what the system-wide total above is made of. Recording them
-    // here means the Statistics page can answer "how much has Steam used this cycle"
-    // from the same measurement the live table shows, rather than estimating.
-    //
-    // Only while the panel has ever been opened, because that is when the monitor
-    // runs: with no attribution running there is nothing per-app to record, and the
-    // system-wide total still accumulates normally.
-    if (m_appMonitor && m_appMonitor->isRunning()) {
-        const QVector<AppTraffic> apps = m_appMonitor->snapshot();
-        for (const AppTraffic &a : apps) {
-            const QString path = a.executablePath.isEmpty() ? a.executableName
-                                                            : a.executablePath;
-            if (path.isEmpty())
-                continue;
-            m_usage->addAppSample(path,
-                                  a.displayName.isEmpty() ? a.executableName : a.displayName,
-                                  a.bytesIn, a.bytesOut);
-        }
-    }
 }
 
 void MainWindow::onUsageChanged()
@@ -3970,6 +4023,9 @@ void MainWindow::setUpdateStatus(const QString &text, bool isError)
         m_updateStatus->style()->polish(m_updateStatus);
     }
     m_updateStatus->setText(text);
+    // The label is hidden at construction; without this every result stayed
+    // invisible, including the one the user asked for.
+    m_updateStatus->setVisible(!text.isEmpty());
 }
 
 void MainWindow::checkForUpdatesNow(bool announce)
@@ -4017,33 +4073,6 @@ void MainWindow::checkForUpdatesNow(bool announce)
                 m_updater->offerUpdate(version, url, notes);
                 once->deleteLater();
             });
-    connect(m_updater, &Updater::updateSkipped, this, [this](const QString &version) {
-        // Persisted, so the check at the next launch honours it before offering anything.
-        Settings s = m_store->load();
-        s.skippedVersion = version;
-        QString error;
-        persistSettings(s, QStringLiteral("your settings"));
-        setUpdateStatus(QStringLiteral("Version %1 skipped. A newer version will be offered.")
-                            .arg(version),
-                        false);
-    });
-    connect(m_updater, &Updater::updateDeferred, this, [this](const QString &version) {
-        setUpdateStatus(QStringLiteral("Update %1 postponed. It will be offered again.")
-                            .arg(version),
-                        false);
-
-        // Offered again later in the same session, not only at the next launch: a machine that
-        // stays on for days would otherwise never mention it again. One timer, restarted rather
-        // than stacked, so choosing Later twice does not queue two prompts.
-        if (!m_updateSnooze) {
-            m_updateSnooze = new QTimer(this);
-            m_updateSnooze->setSingleShot(true);
-            m_updateSnooze->setInterval(kUpdateSnoozeMs);
-            connect(m_updateSnooze, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
-        }
-        m_updateSnooze->start();
-    });
-
     connect(m_updater, &Updater::upToDate, once,
             [this, once, restore, announce](const QString &version) {
                 restore();

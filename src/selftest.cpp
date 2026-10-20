@@ -168,6 +168,10 @@ void checkMonitoring(Report &r, int seconds)
                QStringLiteral("%1% of received events produced a byte count "
                               "(a low figure means the payload schema differs from the "
                               "decoder)").arg(QString::number(pct, 'f', 1)));
+        r.item(Outcome::Info, QStringLiteral("UDP events counted"),
+               QString::number(monitor.udpEventsTotal()));
+        r.item(Outcome::Info, QStringLiteral("Event ids seen"),
+               monitor.eventIdReport());
     }
 
     if (sawTrafficIntervals > 0) {

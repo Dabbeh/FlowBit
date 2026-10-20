@@ -194,6 +194,10 @@ public:
     // shared one was held by an orphaned session. Surfaced in diagnostics.
     bool usedFallbackName = false;
     TRACEHANDLE traceHandle = INVALID_PROCESSTRACE_HANDLE;
+    // Must outlive ProcessTrace: OpenTrace receives the address of this structure, which
+    // holds the callback and session name. A stack local here was the other reason the
+    // consumer could sit at zero while the session was visibly running.
+    EVENT_TRACE_LOGFILEW logfile{};
     bool sessionOwned = false;
     QThread *thread = nullptr;
     std::atomic<bool> stopping{false};
@@ -214,7 +218,7 @@ public:
     // count is what separates "never enabled" from "enabled and silent" in the report.
     std::atomic<quint32> providerEnableRc{0};
     std::atomic<int> providerEnableAttempts{0};
-    std::atomic<int> reenableCount{0};
+    std::atomic<bool> reenableTried{false};
 
     // Counts events so the UI can tell "session running, no traffic" apart from
     // "session running but delivering nothing".
@@ -1064,6 +1068,7 @@ void AppMonitor::Impl::collectEstats()
         plain.dwRemotePort = r.dwRemotePort;
 
         ConnCounters &c = connLast[key];
+        const bool firstRead = !c.enabled;
 
         // Enable collection once per connection (idempotent). Without it the ROD
         // reads return garbage - documented in the feasibility scan.
@@ -1077,7 +1082,6 @@ void AppMonitor::Impl::collectEstats()
                 connLast.remove(key);
                 continue;
             }
-            c.enabled = true;
         }
 
         TCP_ESTATS_DATA_ROD_v0 rod{};
@@ -1086,6 +1090,17 @@ void AppMonitor::Impl::collectEstats()
                                       reinterpret_cast<PUCHAR>(&rod), 0, sizeof(rod))
             != NO_ERROR)
             continue;
+
+        // The first successful read after enabling reports the connection's lifetime
+        // bytes, which are not new traffic. Seed the baseline and book nothing. Keep
+        // enabled false until that read succeeds, or a failed first read would make
+        // the next one book the whole lifetime.
+        if (firstRead) {
+            c.in = rod.DataBytesIn;
+            c.out = rod.DataBytesOut;
+            c.enabled = true;
+            continue;
+        }
 
         const quint64 dIn = (rod.DataBytesIn >= c.in) ? rod.DataBytesIn - c.in : 0;
         const quint64 dOut = (rod.DataBytesOut >= c.out) ? rod.DataBytesOut - c.out : 0;
@@ -1259,11 +1274,15 @@ bool AppMonitor::Impl::startSession(QString *why)
         props->Wnode.BufferSize = bufferSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;   // QPC timestamps
-        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+                             | EVENT_TRACE_INDEPENDENT_SESSION_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->BufferSize = 64;           // KB, small: only counters are wanted
-        props->MinimumBuffers = 4;
-        props->MaximumBuffers = 16;
+        // Kernel-Network emits one event per packet, so 64 KB buffers overflow within a
+        // fraction of a second and the real-time consumer receives nothing at all. Give the
+        // logger room to breathe: 16 x 1 MB start, up to 64 MB under load.
+        props->BufferSize = 1024;         // KB
+        props->MinimumBuffers = 16;
+        props->MaximumBuffers = 64;
         props->FlushTimer = 1;
 
         auto *nameField = reinterpret_cast<wchar_t *>(propsBuf.data() + props->LoggerNameOffset);
@@ -1408,7 +1427,7 @@ bool AppMonitor::Impl::startSession(QString *why)
     // the level-5 kernel-network events. Full keyword mask plus verbose level.
 
     // Open the real-time consumer.
-    EVENT_TRACE_LOGFILEW logfile{};
+    logfile = EVENT_TRACE_LOGFILEW{};
     logfile.LoggerName = const_cast<LPWSTR>(sessionNameInUse());
     logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
                                | PROCESS_TRACE_MODE_EVENT_RECORD;
@@ -1781,7 +1800,7 @@ QString AppMonitor::consumerReport() const
         state += QStringLiteral(" \u00b7 enable %1, attempt %2%3")
                      .arg(rc == 0 ? QStringLiteral("ok") : QString::number(rc))
                      .arg(attempts)
-                     .arg(m_impl->reenableCount.load() > 0 ? QStringLiteral(", re-enabled %1x").arg(m_impl->reenableCount.load()) : QString());
+                     .arg(m_impl->reenableTried.load() ? QStringLiteral(", re-enabled after 5s") : QString());
     }
     return state;
 }
@@ -1940,23 +1959,12 @@ void AppMonitor::tick()
     // provably had time to attach, costs nothing and has been the difference between a silent
     // session and a working one. Deliberately once: a provider that still says nothing is a fact to
     // report, not a call to loop on.
-    if (state() == MonitorState::Running && m_impl->eventsSeen.load() == 0
-        && m_impl->providerEnableAttempts.load() > 0) {
-        // Two attempts, at one second and at five.
-        //
-        // On the reporting machine the first enable - issued just after the consumer thread starts -
-        // was swallowed: the session ran and delivered nothing until a re-enable arrived. With the
-        // retry at five seconds that cost five seconds of no data and reported "attempt 2". One
-        // second is enough for the consumer to be inside ProcessTrace on every machine seen so far,
-        // so the rescue happens at the same moment the session becomes visible in the UI. The
-        // second retry at five seconds remains for a machine slower than that.
-        const int done = m_impl->reenableCount.load();
-        const int atSecond = (done == 0) ? 1 : 5;
-        if (done < 2 && m_impl->consumerSeconds() >= atSecond) {
-            m_impl->reenableCount.fetch_add(1);
-            qInfo("Flowbit: no events after %ds - re-enabling the provider (retry %d)", atSecond, done + 1);
-            m_impl->enableProvider();
-        }
+    if (!m_impl->reenableTried.load() && state() == MonitorState::Running
+        && m_impl->eventsSeen.load() == 0 && m_impl->providerEnableAttempts.load() > 0
+        && m_impl->consumerSeconds() >= 5) {
+        m_impl->reenableTried.store(true);
+        qInfo("Flowbit: no events after 5s - re-enabling the provider once");
+        m_impl->enableProvider();
     }
 
     // Self-recovery: a consumer that returned while the session is still wanted is rebuilt.
@@ -2035,7 +2043,7 @@ void AppMonitor::tick()
 
     m_impl->completeInterval(seconds, seconds);
     ++m_impl->tickCount;
-    if (m_tickCount % 20 == 0)
+    if (++m_tickCount % 20 == 0)
         m_impl->sweepDeadPids();
 
     emit updated();

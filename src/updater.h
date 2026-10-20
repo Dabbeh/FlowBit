@@ -31,8 +31,12 @@ namespace net {
 //     {
 //       "version": "1.1.0",
 //       "url": "https://github.com/.../releases/download/v1.1.0/Flowbit.exe",
+//       "sha256": "lowercase SHA-256 of that exact executable",
 //       "notes": "Optional, shown before installing."
 //     }
+//
+// The checksum is required for an offered update: the downloaded file is not
+// installed unless it matches.
 //
 // Publishing an update is therefore: upload the executable to a release, edit one line of
 // that file. A full releases API would work too, but it needs the release to be tagged in
@@ -40,7 +44,7 @@ namespace net {
 //
 // NOTHING IS INSTALLED WITHOUT CONSENT. The check only reads the small JSON file; the
 // download begins only after the user accepts the offered version, and the swap only
-// after the download completes and its size is plausible.
+// after the download completes and matches the published SHA-256.
 class Updater : public QObject
 {
     Q_OBJECT
@@ -87,12 +91,14 @@ signals:
 private:
     void onVersionReply(QNetworkReply *reply);
     void beginDownload(const QString &version, const QString &url, const QString &notes);
-    void installDownloaded(const QString &version, const QString &path);
+    void installDownloaded(const QString &version, const QString &path,
+                           const QString &sha256);
 
     QWidget *m_ui = nullptr;
     QNetworkAccessManager *m_net = nullptr;
     QProgressDialog *m_progress = nullptr;
     QString m_pendingVersion;
+    QString m_offeredSha256;
 };
 
 } // namespace net

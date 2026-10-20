@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -14,6 +15,7 @@
 #include <QProcess>
 #include <QProgressDialog>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QUrl>
 
@@ -31,6 +33,17 @@ QString g_versionUrl =
 // Shared with the existing deploy script so the two cannot disagree about the file names.
 const char *kStagedExe = "Flowbit-update.exe";
 const char *kTargetExe = "Flowbit.exe";
+
+QString sha256OfFile(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return {};
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file))
+        return {};
+    return QString::fromLatin1(hash.result().toHex());
+}
 
 } // namespace
 
@@ -97,6 +110,9 @@ void Updater::checkForUpdate()
                          QNetworkRequest::AlwaysNetwork);
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       QStringLiteral("Flowbit/%1").arg(currentVersion()));
+    // Bounds a stalled connection; without it "Checking..." could stay disabled
+    // for the rest of the session.
+    request.setTransferTimeout(15000);
 
     QNetworkReply *reply = m_net->get(request);
     connect(reply, &QNetworkReply::finished, this, [this, reply] { onVersionReply(reply); });
@@ -138,6 +154,17 @@ void Updater::onVersionReply(QNetworkReply *reply)
         return;
     }
 
+    // Required, not optional: an update without a published checksum cannot be
+    // verified, and a corrupt or substituted executable would be installed.
+    const QString sha256 = root.value(QStringLiteral("sha256")).toString().trimmed().toLower();
+    static const QRegularExpression hex64(QStringLiteral("^[0-9a-f]{64}$"));
+    if (!hex64.match(sha256).hasMatch()) {
+        emit failed(QStringLiteral("The version file has no valid SHA-256 checksum, so the "
+                                   "update was not offered."));
+        return;
+    }
+    m_offeredSha256 = sha256;
+
     emit updateAvailable(version, url, notes);
 }
 
@@ -149,6 +176,21 @@ void Updater::offerUpdate(const QString &version, const QString &url, const QStr
 void Updater::beginDownload(const QString &version, const QString &url, const QString &notes)
 {
     m_pendingVersion = version;
+
+    if (m_offeredSha256.isEmpty()) {
+        QMessageBox::warning(m_ui, QStringLiteral("Update"),
+                             QStringLiteral("This update has no published checksum, so it "
+                                            "will not be installed."));
+        return;
+    }
+
+    const QUrl downloadUrl(url);
+    if (downloadUrl.scheme() != QLatin1String("https")) {
+        QMessageBox::warning(m_ui, QStringLiteral("Update"),
+                             QStringLiteral("The download address is not HTTPS, so it will not "
+                                            "be used."));
+        return;
+    }
 
     // The offer comes before any download, so nothing is transferred without consent -
     // including on a metered connection, where several megabytes is not a trivial cost.
@@ -215,11 +257,12 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
     m_progress->setAutoReset(false);
     m_progress->setValue(0);
 
-    QNetworkRequest request{QUrl(url)};
+    QNetworkRequest request{downloadUrl};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       QStringLiteral("Flowbit/%1").arg(currentVersion()));
+    request.setTransferTimeout(30000);
 
     QNetworkReply *reply = m_net->get(request);
 
@@ -243,7 +286,9 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
             reply->abort();
     });
 
-    connect(reply, &QNetworkReply::finished, this, [this, reply, file, staged, version] {
+    const QString sha256 = m_offeredSha256;
+    connect(reply, &QNetworkReply::finished, this,
+            [this, reply, file, staged, version, sha256] {
         if (file->isOpen()) {
             file->write(reply->readAll());
             file->close();
@@ -278,25 +323,35 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
             return;
         }
 
-        installDownloaded(version, staged);
+        if (sha256OfFile(staged).compare(sha256, Qt::CaseInsensitive) != 0) {
+            QFile::remove(staged);
+            QMessageBox::warning(
+                m_ui, QStringLiteral("Update"),
+                QStringLiteral("The download did not match the published SHA-256 checksum, "
+                               "so it has not been installed."));
+            return;
+        }
+
+        installDownloaded(version, staged, sha256);
     });
 }
 
-void Updater::installDownloaded(const QString &version, const QString &path)
+void Updater::installDownloaded(const QString &version, const QString &path,
+                                const QString &sha256)
 {
     Q_UNUSED(path)
 
     // The swap is done by a script rather than by Flowbit itself.
     //
     // Windows locks a running executable, so Flowbit cannot overwrite its own file. The
-    // script waits for this process to exit, copies the staged file over the target,
-    // verifies the copy by hash, and starts Flowbit again elevated. That last part
-    // matters: a relaunch without elevation would leave the new instance unable to load
-    // its driver, which is the failure this project has already met once.
+    // script waits for this process to exit, swaps in a verified copy, and starts Flowbit
+    // again elevated. That last part matters: a relaunch without elevation would leave the
+    // new instance unable to load its driver, which is the failure this project has already
+    // met once.
     const QString dir = QCoreApplication::applicationDirPath();
     const QString scriptPath = QDir(dir).filePath(QStringLiteral("flowbit-self-update.ps1"));
 
-    const QString script = QStringLiteral(R"PS(
+    QString script = QStringLiteral(R"PS(
 $ErrorActionPreference = 'Continue'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $dir
@@ -312,30 +367,57 @@ Start-Sleep -Milliseconds 800
 
 $staged = Join-Path $dir 'Flowbit-update.exe'
 $target = Join-Path $dir 'Flowbit.exe'
-if (-not (Test-Path $staged)) { exit 1 }
-
-$want = (Get-FileHash $staged).Hash
+$new = Join-Path $dir 'Flowbit.exe.new'
+$expected = '__EXPECTED_SHA__'
 $ok = $false
-for ($c = 1; $c -le 5; $c++) {
-    Copy-Item $staged $target -Force
-    if ((Get-FileHash $target).Hash -eq $want) { $ok = $true; break }
-    Start-Sleep -Milliseconds 700
+
+if (Test-Path $staged) {
+    $stagedHash = (Get-FileHash $staged -Algorithm SHA256).Hash.ToLower()
+    if ($stagedHash -eq $expected) {
+        for ($c = 1; $c -le 5; $c++) {
+            # Copy beside the target and move it into place, so a failed copy can never
+            # leave a half-written Flowbit.exe behind.
+            Copy-Item $staged $new -Force
+            if ((Get-FileHash $new -Algorithm SHA256).Hash.ToLower() -eq $expected) {
+                Move-Item $new $target -Force -ErrorAction SilentlyContinue
+                if ((Test-Path $target) -and `
+                    ((Get-FileHash $target -Algorithm SHA256).Hash.ToLower() -eq $expected)) {
+                    $ok = $true
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 700
+        }
+    }
 }
-if ($ok) { Remove-Item $staged -Force -ErrorAction SilentlyContinue }
+
+Remove-Item $new -Force -ErrorAction SilentlyContinue
+if ($ok) {
+    Remove-Item $staged -Force -ErrorAction SilentlyContinue
+} else {
+    Add-Type -AssemblyName PresentationFramework
+    [System.Windows.MessageBox]::Show(
+        "Flowbit could not install the update. The existing version will start.",
+        "Flowbit update", 'OK', 'Warning') | Out-Null
+}
 
 # Relaunch elevated: an unelevated Flowbit cannot load its driver.
-Start-Process -FilePath $target -Verb RunAs
+if (Test-Path $target) {
+    $started = Start-Process -FilePath $target -Verb RunAs -PassThru -ErrorAction SilentlyContinue
+    if (-not $started) {
+        Add-Type -AssemblyName PresentationFramework
+        [System.Windows.MessageBox]::Show(
+            "Flowbit could not be restarted. Start it from the Start menu.",
+            "Flowbit update", 'OK', 'Warning') | Out-Null
+    }
+}
 
-# Remove this script last. It is running from the file being deleted, which Windows allows -
-# the image is already loaded and the directory entry goes when the handle closes - and doing
-# it here rather than leaving it means no helper accumulates in the install folder across
-# a series of updates.
-#
-# Only removed after a successful copy: if the update failed, the script is the only record
-# of what was attempted, and the install folder having it there is useful evidence rather
-# than clutter.
+# Remove this script last. Only after a successful copy: on failure it is useful
+# evidence of what was attempted.
 if ($ok) { Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue }
 )PS");
+
+    script.replace(QStringLiteral("__EXPECTED_SHA__"), sha256);
 
     QFile scriptFile(scriptPath);
     if (!scriptFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -355,10 +437,22 @@ if ($ok) { Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction Silently
 
     // Detached, so the helper outlives this process - which it must, since its whole job
     // is to wait for Flowbit to exit.
-    QProcess::startDetached(QStringLiteral("powershell.exe"),
-                            {QStringLiteral("-NoProfile"),
-                             QStringLiteral("-ExecutionPolicy"), QStringLiteral("Bypass"),
-                             QStringLiteral("-File"), scriptPath});
+    const bool started = QProcess::startDetached(
+        QStringLiteral("powershell.exe"),
+        {QStringLiteral("-NoProfile"),
+         QStringLiteral("-ExecutionPolicy"), QStringLiteral("Bypass"),
+         QStringLiteral("-File"), scriptPath});
+
+    if (!started) {
+        // Do not close Flowbit when the helper did not start: the user would lose the
+        // running application and the update would not happen.
+        QFile::remove(scriptPath);
+        QMessageBox::warning(
+            m_ui, QStringLiteral("Update"),
+            QStringLiteral("The update helper could not be started, so Flowbit has not "
+                           "been closed and the update has not been installed."));
+        return;
+    }
 
     QApplication::quit();
 }
