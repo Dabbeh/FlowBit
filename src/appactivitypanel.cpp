@@ -226,6 +226,16 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     m_scopeNoteLabel->setText(QStringLiteral(
         "Measuring TCP traffic only \u2014 UDP/QUIC apps may read lower than the "
         "system total."));
+    // The visible line says WHAT the table is measuring; the tooltip says WHY, because the answer
+    // is a state the user cannot see from here: the detailed source is silent, so Flowbit is on the
+    // TCP-counter fallback. Without this the note reads as a permanent limitation of the app rather
+    // than as a description of the source currently in use.
+    m_scopeNoteLabel->setToolTip(
+        QStringLiteral("The detailed ETW source has delivered no events in this session, so "
+                       "per-application figures come from Windows' TCP connection counters. Those "
+                       "counters have no UDP data at all.\n\nSettings \u2192 Diagnostics shows the "
+                       "ETW consumer state and which event ids arrived - that is where to look if "
+                       "this note stays visible while traffic is flowing."));
     // Wrapped, because an unwrapped label demands its whole text on one line and a layout takes
     // that as a minimum width for the panel. A sentence here made the panel wider than the
     // window, which pushed the table's columns off the right edge - in a full-screen window as
