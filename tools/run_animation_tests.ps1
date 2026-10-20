@@ -32,6 +32,7 @@ $sources = @(
     "$srcRoot\tools\test_animation_curve.cpp",
     "$srcRoot\src\appactivitypanel.cpp",
     "$srcRoot\src\appmonitor.cpp",
+    "$srcRoot\src\etwclass.cpp",
     "$srcRoot\src\appnames.cpp",
     "$srcRoot\src\theme.cpp",
     "$srcRoot\src\checkmark.cpp",

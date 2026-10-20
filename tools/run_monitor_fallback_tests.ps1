@@ -18,9 +18,11 @@ $qtLib = 'C:\Qt\6.10.0\mingw_64\lib'
 
 & $moc "-I$srcRoot\src" "-I$qtInc" "$srcRoot\src\appmonitor.h" -o (Join-Path $outDir 'moc_appmonitor.cpp')
 
+
 $sources = @(
     "$srcRoot\tools\test_monitor_fallback.cpp",
     "$srcRoot\src\appmonitor.cpp",
+    "$srcRoot\src\etwclass.cpp",
     "$srcRoot\src\appnames.cpp",
     "$srcRoot\src\theme.cpp",
     "$srcRoot\src\checkmark.cpp",

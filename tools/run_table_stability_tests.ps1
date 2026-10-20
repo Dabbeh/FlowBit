@@ -36,6 +36,7 @@ $sources = @(
     "$srcRoot\tools\test_table_stability.cpp",
     "$srcRoot\src\appactivitypanel.cpp",
     "$srcRoot\src\appmonitor.cpp",
+    "$srcRoot\src\etwclass.cpp",
     "$srcRoot\src\appnames.cpp",
     "$srcRoot\src\theme.cpp",
     "$srcRoot\src\checkmark.cpp",

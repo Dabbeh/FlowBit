@@ -15,7 +15,10 @@ namespace net {
 SpeedGraph::SpeedGraph(QWidget *parent) : QWidget(parent)
 {
     setAttribute(Qt::WA_OpaquePaintEvent, false);
-    setMinimumHeight(90);
+    setMinimumHeight(110);
+    // Grows with the window instead of staying a fixed strip: the card already gives it stretch,
+    // and the plot is drawn from rect() so a larger area is simply a larger graph.
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
 void SpeedGraph::addSample(double downBytesPerSec, double upBytesPerSec)
@@ -79,8 +82,69 @@ void SpeedGraph::paintEvent(QPaintEvent *)
 
     drawGrid(p, plot);
     drawMountain(p, plot, maxValue);
+    drawAverages(p, plot, maxValue);
     drawCeiling(p, plot, maxValue);
     drawAxisLabels(p, plot, maxValue);
+}
+
+double SpeedGraph::averageDown() const
+{
+    if (m_down.isEmpty())
+        return 0.0;
+    double sum = 0.0;
+    for (double v : m_down)
+        sum += v;
+    return sum / double(m_down.size());
+}
+
+double SpeedGraph::averageUp() const
+{
+    if (m_up.isEmpty())
+        return 0.0;
+    double sum = 0.0;
+    for (double v : m_up)
+        sum += v;
+    return sum / double(m_up.size());
+}
+
+void SpeedGraph::drawAverages(QPainter &p, const QRectF &plot, double maxValue) const
+{
+    if (m_down.isEmpty())
+        return;
+
+    auto yFor = [&](double v) {
+        const double frac = std::clamp(v / maxValue, 0.0, 1.0);
+        return plot.bottom() - frac * plot.height();
+    };
+
+    struct Line {
+        double value;
+        QColor colour;
+        QString label;
+    };
+    const Line lines[] = {
+        {averageDown(), theme::kGraphDownload(), QStringLiteral("avg \u2193")},
+        {averageUp(), theme::kGraphUpload(), QStringLiteral("avg \u2191")},
+    };
+
+    for (const Line &line : lines) {
+        if (line.value <= 0.0)
+            continue;
+        const qreal y = yFor(line.value);
+
+        QPen pen(line.colour, 1, Qt::DashLine);
+        pen.setDashPattern({4, 3});
+        p.setPen(pen);
+        p.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
+
+        // Label inside the plot, at the left edge: the right edge belongs to the axis labels, and
+        // overlapping them would be worse than a slightly cramped label.
+        p.setPen(theme::kTextMuted());
+        p.setFont(theme::uiFont(8, false));
+        const QRectF labelRect(plot.left() + 4, y - 14, 120, 13);
+        p.drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter,
+                   QStringLiteral("%1 %2").arg(line.label, formatRate(line.value)));
+    }
 }
 
 void SpeedGraph::drawGrid(QPainter &p, const QRectF &plot) const

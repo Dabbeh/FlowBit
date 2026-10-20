@@ -121,6 +121,10 @@ public:
     quint64 eventsSeenTotal() const;
     quint64 eventsDecodedTotal() const;
 
+    // UDP events counted in this session. Zero while ETW is the source and UDP traffic has
+    // flowed means the protocol is not arriving, which is worth being able to see.
+    quint64 udpEventsTotal() const;
+
     // True while the panel is being fed from the TCP EStats fallback instead of
     // ETW (some Windows builds deliver zero kernel-network events). TCP-only is
     // the trade: QUIC/UDP traffic is not attributed until ETW recovers, so the

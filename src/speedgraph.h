@@ -31,8 +31,16 @@ public:
 
     void clearHistory();
 
-    QSize sizeHint() const override { return QSize(360, 120); }
-    QSize minimumSizeHint() const override { return QSize(220, 90); }
+    // Mean of the samples currently in view, per direction. Public because it is the value the
+    // graph draws as the average line, and a number drawn on screen should be checkable.
+    double averageDown() const;
+    double averageUp() const;
+
+    // Taller by default, and free to grow: the card gives it stretch, so a maximised window
+    // spends the extra height on the graph rather than leaving it fixed while everything else
+    // grows.
+    QSize sizeHint() const override { return QSize(420, 180); }
+    QSize minimumSizeHint() const override { return QSize(240, 110); }
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -41,6 +49,7 @@ private:
     void drawGrid(QPainter &p, const QRectF &plot) const;
     void drawMountain(QPainter &p, const QRectF &plot, double maxValue) const;
     void drawCeiling(QPainter &p, const QRectF &plot, double maxValue) const;
+    void drawAverages(QPainter &p, const QRectF &plot, double maxValue) const;
     void drawAxisLabels(QPainter &p, const QRectF &plot, double maxValue) const;
 
     static constexpr int kCapacity = 60;

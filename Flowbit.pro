@@ -58,6 +58,7 @@ LIBS += -lwintrust -lcrypt32
 LIBS += -ldwmapi
 
 SOURCES += \
+    src/etwclass.cpp \
     src/main.cpp \
     src/selftest.cpp \
     src/brandmark.cpp \
@@ -98,6 +99,7 @@ SOURCES += \
     src/mainwindow.cpp
 
 HEADERS += \
+    src/etwclass.h \
     src/selftest.h \
     src/throttleengine.h \
     src/settings.h \

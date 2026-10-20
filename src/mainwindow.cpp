@@ -1503,6 +1503,7 @@ QWidget *MainWindow::buildSettingsPage()
             m_diagnosticsPanel->setMonitorRunning(m_appMonitor->isRunning());
             m_diagnosticsPanel->setMonitorTelemetry(m_appMonitor->eventsSeenTotal(),
                                                     m_appMonitor->eventsDecodedTotal(),
+                                                    m_appMonitor->udpEventsTotal(),
                                                     m_appMonitor->runningSeconds());
             m_diagnosticsPanel->setEventLayout(m_appMonitor->etwEventLayout());
             m_diagnosticsPanel->setAddressMiss(m_appMonitor->addressMissReport());

@@ -306,7 +306,7 @@ QString DiagnosticReport::toText() const
     return out;
 }
 
-DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
+DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, quint64 udpEvents, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
                                     const QString &rawEvents,
                                     const QString &rawBits)
 {
@@ -554,6 +554,21 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
             : noEvents                                      ? DiagnosticItem::Status::Warning
                                                             : DiagnosticItem::Status::Ok,
             monitorState);
+
+        // UDP visibility. Until now the decoder recognised only TCP send/receive, so UDP traffic
+        // (DNS, QUIC, WireGuard, games, most video calls) was invisible and the panel was quietly
+        // wrong for anyone using it. This row exists so "is UDP being counted" is answerable from
+        // the report instead of from a guess: zero here while UDP traffic is flowing means the
+        // protocol is not arriving, not that it is being counted.
+        add(QStringLiteral("Monitoring"), QStringLiteral("UDP events counted"),
+            QString::number(udpEvents),
+            udpEvents > 0 ? DiagnosticItem::Status::Ok : DiagnosticItem::Status::Info,
+            udpEvents > 0
+                ? QStringLiteral("UDP is being counted alongside TCP, so DNS, QUIC, WireGuard and "
+                                 "game traffic appear in the application list.")
+                : QStringLiteral("No UDP events in this session. UDP is counted through the same "
+                                 "ETW source as TCP; the TCP-counter fallback cannot see it. If "
+                                 "UDP traffic is flowing, send the saved report."));
 
         // Phase 0.1 evidence: raw address bits and the local address list.
         // Placed first in MONITORING because it is what the direction fix is

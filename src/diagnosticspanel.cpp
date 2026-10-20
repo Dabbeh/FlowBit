@@ -176,10 +176,12 @@ void DiagnosticsPanel::setMonitorError(const QString &error)
     m_monitorError = error;
 }
 
-void DiagnosticsPanel::setMonitorTelemetry(quint64 seen, quint64 decoded, int monitorSeconds)
+void DiagnosticsPanel::setMonitorTelemetry(quint64 seen, quint64 decoded, quint64 udp,
+                                          int monitorSeconds)
 {
     m_seen = seen;
     m_decoded = decoded;
+    m_udp = udp;
     m_monitorSeconds = monitorSeconds;
 }
 
@@ -210,7 +212,7 @@ void DiagnosticsPanel::setRawBits(const QString &text)
 
 void DiagnosticsPanel::refresh()
 {
-    m_report = collectDiagnostics(processIsElevated(), m_monitorError, m_seen, m_decoded,
+    m_report = collectDiagnostics(processIsElevated(), m_monitorError, m_seen, m_decoded, m_udp,
                                   m_monitorRunning, m_monitorSeconds, m_eventLayout, m_addressMiss,
                                   m_rawEvents, m_rawBits);
     buildRows();

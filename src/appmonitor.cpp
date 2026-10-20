@@ -1,4 +1,5 @@
 #include "appmonitor.h"
+#include "etwclass.h"
 
 #include "appnames.h"
 
@@ -174,6 +175,7 @@ public:
     // "session running but delivering nothing".
     std::atomic<quint64> eventsSeen{0};
     std::atomic<quint64> eventsParsed{0};
+    std::atomic<quint64> udpEvents{0};   // UDP events seen, for diagnostics
 
     // Per-event-id decode accounting plus the payload schema of the first event
     // seen for that id. Written by the ETW callback, read by diagnostics: this is
@@ -464,6 +466,24 @@ QPair<quint16, quint16> readEphemeralRange()
     return cached;
 }
 
+// Offset of the event's own name inside TRACE_EVENT_INFO.
+//
+// The Windows SDK declares this as `union { ULONG EventNameOffset; ULONG ActivityIDNameOffset; }` -
+// for a manifest-based event the union holds the event name. MinGW's tdh.h predates that rename and
+// only exposes the older member, at the same offset. Rather than pinning the project to one SDK,
+// the member is probed at compile time: the first overload is chosen when the name exists.
+template <typename Info>
+static auto eventNameOffset(const Info *info, int) -> decltype(info->EventNameOffset)
+{
+    return info->EventNameOffset;
+}
+
+template <typename Info>
+static ULONG eventNameOffset(const Info *info, long)
+{
+    return info->ActivityIDNameOffset;
+}
+
 // EVENT_RECORD callback. Runs on the monitor thread.
 //
 // Reads the payload fields by name through TDH. A field that cannot be resolved
@@ -481,26 +501,6 @@ void WINAPI eventCallback(PEVENT_RECORD record)
     // ratio looked like a decoder failure (measured: 3 164 of 9 270, "34%") when
     // most of the remainder were events deliberately not counted.
     const USHORT id = record->EventHeader.EventDescriptor.Id;
-    const bool isV6 = (id == kTcpIpv6Send || id == kTcpIpv6Recv
-                       || id == kTcpIpv6Retransmit);
-    const bool isTransfer = (id == kTcpSend || id == kTcpRecv
-                             || id == kTcpRetransmit || isV6);
-    if (!isTransfer)
-        return;
-
-    impl->eventsSeen.fetch_add(1);
-    impl->etwProven = true;   // proof, from now on, that this source works
-
-    // Retransmissions arrive as their own events (ids 14 and 30) and carry the size of data that
-    // was already counted when it was first sent. Adding them again inflates per-application
-    // usage above the traffic that actually moved - and it makes the figure disagree with the
-    // TCP-counter source, whose DataBytes numbers count sequence space rather than wire repeats,
-    // so the same app would read differently depending on which source happened to be active.
-    //
-    // They are still proof that the source is alive, which is why the latch above runs first, but
-    // they contribute no bytes.
-    if (id == kTcpRetransmit || id == kTcpIpv6Retransmit)
-        return;
 
     // NOTE: the owning process comes from the payload's PID property (read
     // below), NOT from EventHeader.ProcessId. Using the header was part of the
@@ -549,6 +549,36 @@ void WINAPI eventCallback(PEVENT_RECORD record)
     }
 
     auto *info = reinterpret_cast<PTRACE_EVENT_INFO>(schema->data());
+
+    // Classify by the event's OWN NAME, with the id table as a fallback - see etwclass.h for why.
+    //
+    // This is what makes UDP visible. The decoder previously recognised only TCP send/receive by
+    // hardcoded ids, so DNS, QUIC, WireGuard, game and video-call traffic were invisible even
+    // though the provider reports all of it and Resource Monitor shows it. Names also cover the
+    // IPv4 and IPv6 variants without a table to keep in step.
+    const wchar_t *eventName = nullptr;
+    const ULONG nameOffset = eventNameOffset(info, 0);
+    if (nameOffset) {
+        eventName = reinterpret_cast<const wchar_t *>(
+            reinterpret_cast<const BYTE *>(info) + nameOffset);
+    }
+
+    const etwclass::Kind kind = etwclass::classify(eventName, id);
+    if (!kind.transfer)
+        return;   // connect, disconnect, copy, failure: carries no bytes to count
+
+    impl->eventsSeen.fetch_add(1);
+    impl->etwProven = true;   // proof, from now on, that this source works
+    if (kind.udp)
+        impl->udpEvents.fetch_add(1);
+
+    // Retransmissions carry the size of data that was already counted when it was first sent.
+    // Adding them again inflates per-application usage above the traffic that actually moved - and
+    // it disagrees with the TCP-counter source, whose DataBytes numbers count sequence space rather
+    // than wire repeats, so the same application would read differently depending on which source
+    // was active. They still prove the source is alive, which is why the latch above runs first.
+    if (kind.retransmit)
+        return;
 
     // ---------------------------------------------------------------------
     // Payload decode, written against the schema in
@@ -706,8 +736,7 @@ void WINAPI eventCallback(PEVENT_RECORD record)
     // The 3-tuple below is the whole rule; the port and address heuristics that
     // used to live here are deleted rather than kept as fallbacks, because they
     // could only ever produce a wrong answer once the id decides correctly.
-    const bool send = (id == kTcpSend || id == kTcpRetransmit
-                       || id == kTcpIpv6Send || id == kTcpIpv6Retransmit);
+    const bool send = kind.send;
 
     // Record the raw evidence for this event. Cheap, bounded, and it is what made
     // the rule above provable - keep it until the direction is confirmed live.
@@ -1634,6 +1663,11 @@ bool AppMonitor::usingTcpFallback() const
 quint64 AppMonitor::eventsSeenTotal() const
 {
     return m_impl->eventsSeen.load();
+}
+
+quint64 AppMonitor::udpEventsTotal() const
+{
+    return m_impl->udpEvents.load();
 }
 
 quint64 AppMonitor::eventsDecodedTotal() const
