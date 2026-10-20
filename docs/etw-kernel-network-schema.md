@@ -70,6 +70,39 @@ machine to re-derive the whole table (`etw_schema_dump.exe <out.log>`, elevated)
    **10 and 11**. Treating 12/13 as "UDP" (as earlier code comments claimed) is
    wrong for this provider revision.
 
+
+## UDP: the missing half (researched, then confirmed against Microsoft's own mapping)
+
+This document originally recorded only TCP ids, and warned that ids 12/13 are TCP
+connect/disconnect rather than UDP. That was correct, and it left UDP uncounted - so DNS, QUIC,
+WireGuard, game traffic and most video calls never appeared in the application list, while Windows'
+own Resource Monitor (same provider) showed them.
+
+The ids are not in any header shipped on this machine and the provider manifest is not on disk. They
+are, however, in Microsoft's own generated mapping of this exact provider:
+
+  github.com/microsoft/Tx  ->  Generated/Microsoft_Windows_Kernel_Network.cs
+  provider {{7dd42a49-5329-4832-8dfd-43d979153a88}}
+
+| Id | Event | Manifest message | Direction |
+|---|---|---|---|
+| 42 | KNetEvt_SendIPV4Udp | "UDPv4: %2 bytes transmitted ..." | UDP send |
+| 43 | KNetEvt_RecvIPV4Udp | "UDPv4: %2 bytes received ..." | UDP receive |
+| 58 | KNetEvt_SendIPV6Udp | "UDPv6: %2 bytes transmitted ..." | UDP send |
+| 59 | KNetEvt_RecvIPV6Udp | "UDPv6: %2 bytes received ..." | UDP receive |
+| 49 | KNetEvt_FailUdp | "UDPv4: Connection attempt failed ..." | no bytes |
+
+A second lesson from the same file: the manifest does NOT name its events "KNetEvt_UdpSend". The
+symbols are `KNetEvt_SendIPV4Udp` and the messages are `Data_sent_over_UDP_protocol_` - lowercase
+"UDP" and the verb "sent", not "Send". A matcher looking for "Udp" and "Send" case-sensitively
+misses the message form. The classifier therefore compares case-insensitively and accepts both
+"send"/"sent" and "recv"/"receiv". Ids remain the primary rule; names are the fallback for builds
+whose ids differ.
+
+Verification available at runtime: Diagnostics has a "UDP events counted" row. Zero there while UDP
+traffic is flowing means the events are not arriving on this build, which is a different fault from
+being miscounted.
+
 ## What went wrong in the app (recorded so it is not repeated)
 
 | Symptom | Root cause | Fix |

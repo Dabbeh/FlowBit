@@ -77,6 +77,35 @@ int main(int argc, char *argv[])
         check(!d.transfer, "an unknown id with no name is ignored, as before");
     }
 
+
+    // ---- UDP by ID, from Microsoft's generated manifest mapping -------------
+    {
+        struct Case { unsigned short id; bool send; const char *what; };
+        const Case cases[] = {
+            {42, true,  "id 42 is UDP send (KNetEvt_SendIPV4Udp)"},
+            {43, false, "id 43 is UDP receive (KNetEvt_RecvIPV4Udp)"},
+            {58, true,  "id 58 is UDP send IPv6 (KNetEvt_SendIPV6Udp)"},
+            {59, false, "id 59 is UDP receive IPv6 (KNetEvt_RecvIPV6Udp)"},
+        };
+        for (const Case &c : cases) {
+            const auto k = etwclass::classify(nullptr, c.id);
+            check(k.transfer && k.udp && k.send == c.send && !k.retransmit,
+                  QString::fromLatin1(c.what));
+        }
+        const auto fail = etwclass::classify(nullptr, 49);
+        check(!fail.transfer, "id 49 (UDP failure) carries no bytes");
+    }
+
+    // ---- the manifest message names, which are not CamelCase ---------------
+    {
+        const auto a = etwclass::classify(L"Data_sent_over_UDP_protocol_", 42);
+        const auto b = etwclass::classify(L"Data_received_over_UDP_protocol_", 43);
+        check(a.transfer && a.udp && a.send, "the lowercase message name classifies as a UDP send");
+        check(b.transfer && b.udp && !b.send, "and the received form classifies as a receive");
+        const auto c = etwclass::classify(L"KNetEvt_SendIPV4Udp", 42);
+        check(c.transfer && c.udp && c.send, "the CamelCase symbol classifies identically");
+    }
+
     std::printf("\n== graph averages ==\n");
     {
         SpeedGraph g;
