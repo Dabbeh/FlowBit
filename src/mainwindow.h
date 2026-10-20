@@ -70,6 +70,13 @@ public:
     // Completion handler for the off-thread startup-task change.
     void onStartupSettingApplied(bool ok, const QString &error);
 
+    // Saves settings and reports a failure where the user can see it.
+    //
+    // Several call sites discarded the result, so a full disk or a permissions problem made a
+    // setting look applied while it silently reverted at the next launch. `what` names the thing
+    // that could not be saved ("the theme", "your schedule") so the message says something.
+    bool persistSettings(const Settings &s, const QString &what);
+
     // True while a schtasks call is in flight. schtasks can take seconds; waiting for it on the
     // GUI thread froze the window for up to the 20s timeout, which is why it now runs elsewhere.
     bool m_startupApplying = false;

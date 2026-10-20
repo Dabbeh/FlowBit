@@ -311,7 +311,7 @@ void MainWindow::onAppRuleAdd()
 
     Settings settings = m_store->load();
     settings.appRules.append(rule);
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -335,7 +335,7 @@ void MainWindow::onAppRuleEdit(quint64 id)
     result.windows = edited.windows;         // owned by the schedule dialog
 
     settings.appRules[index] = result;
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -359,7 +359,7 @@ void MainWindow::onAppRuleDelete(quint64 id)
         return;
 
     settings.appRules.remove(index);
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -374,7 +374,7 @@ void MainWindow::onAppRuleEnabledChanged(quint64 id, bool enabled)
         return;
 
     settings.appRules[index].enabled = enabled;
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -468,7 +468,7 @@ void MainWindow::onAppRuleSchedule(quint64 id)
         rule.windows.append(extra);
     }
 
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -1237,8 +1237,7 @@ QWidget *MainWindow::buildSettingsPage()
                         return;
                     Settings s = m_store->load();
                     s.themeMode = Settings::ThemeMode(m_pageThemeCombo->currentData().toInt());
-                    QString error;
-                    m_store->save(s, &error);
+                    persistSettings(s, QStringLiteral("the theme"));
                     theme::setMode(s.themeMode == Settings::ThemeMode::Light
                                        ? theme::Mode::Light
                                        : (s.themeMode == Settings::ThemeMode::Dark
@@ -1305,7 +1304,7 @@ QWidget *MainWindow::buildSettingsPage()
             Settings s = m_store->load();
             s.startWithWindows = on;
             QString error;
-            m_store->save(s, &error);
+            persistSettings(s, QStringLiteral("your settings"));
 
             // The setting and the mechanism are changed together. They are the same fact
             // stored twice - the file records the intent, and a scheduled task or the Run key
@@ -1362,8 +1361,7 @@ QWidget *MainWindow::buildSettingsPage()
                         return;
                     Settings s = m_store->load();
                     s.closeToTray = m_closeCombo->currentData().toInt() != 0;
-                    QString error;
-                    m_store->save(s, &error);
+                    persistSettings(s, QStringLiteral("the theme"));
                     refreshStartupNote();
                 });
         closeRow->addWidget(m_closeCombo);
@@ -1402,7 +1400,7 @@ QWidget *MainWindow::buildSettingsPage()
             Settings s = m_store->load();
             s.checkForUpdates = on;
             QString error;
-            m_store->save(s, &error);
+            persistSettings(s, QStringLiteral("your settings"));
         });
         updateRow->addWidget(m_updateCheck);
         cl->addLayout(updateRow);
@@ -3222,8 +3220,10 @@ void MainWindow::onResetCycle()
     Settings settings = m_store->load();
     settings.usage.cycleStart = QDate::currentDate();
 
-    QString error;
-    m_store->save(settings, &error);
+    // If this save fails the cycle start is not remembered and the next launch begins a cycle
+    // again - the reset appears to have worked and then did not, so the failure is reported.
+    if (!persistSettings(settings, QStringLiteral("the billing cycle")))
+        return;
 
     m_usage->resetCurrentCycle(settings.usage);
     refreshUsage();
@@ -3338,8 +3338,7 @@ void MainWindow::onThemeModeChanged()
     Settings settings = m_store->load();
     settings.themeMode = Settings::ThemeMode(m_themeCombo->currentData().toInt());
 
-    QString error;
-    m_store->save(settings, &error);
+    persistSettings(settings, QStringLiteral("the theme"));
 
     theme::setMode(settings.themeMode == Settings::ThemeMode::Light
                        ? theme::Mode::Light
@@ -3622,7 +3621,7 @@ void MainWindow::resetEverything()
     // Write the defaults back, so the application is running what it will read next launch.
     // The file was removed above; this creates it fresh rather than leaving nothing behind.
     const Settings defaults;
-    m_store->save(defaults, &ignored);
+    persistSettings(defaults, QStringLiteral("your settings"));
 
     // Apply the defaults to the running application rather than waiting for a restart.
     //
@@ -3647,6 +3646,18 @@ void MainWindow::resetEverything()
 
     statusBar()->showMessage(QStringLiteral("Flowbit has been reset to its default settings."),
                              5000);
+}
+
+bool MainWindow::persistSettings(const Settings &s, const QString &what)
+{
+    QString error;
+    if (!m_store->save(s, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("Could not save %1: %2").arg(what, error), 8000);
+        qWarning("Flowbit: could not save %s: %s", qPrintable(what), qPrintable(error));
+        return false;
+    }
+    return true;
 }
 
 void MainWindow::applyStartupSetting()
@@ -3879,7 +3890,7 @@ void MainWindow::checkForUpdatesNow(bool announce)
         Settings s = m_store->load();
         s.skippedVersion = version;
         QString error;
-        m_store->save(s, &error);
+        persistSettings(s, QStringLiteral("your settings"));
         setUpdateStatus(QStringLiteral("Version %1 skipped. A newer version will be offered.")
                             .arg(version),
                         false);
@@ -4016,7 +4027,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
         if (!hintSettings.trayHintShown) {
             hintSettings.trayHintShown = true;
             QString hintError;
-            m_store->save(hintSettings, &hintError);
+            persistSettings(hintSettings, QStringLiteral("your hintSettings"));
             m_tray->showMessage(
                 QStringLiteral("Flowbit"),
                 QStringLiteral("Flowbit keeps running in the notification area so "

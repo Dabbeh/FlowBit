@@ -154,7 +154,11 @@ void UsageTracker::loadAppsMonth(const QDate &month)
 
 void UsageTracker::storeAppsMonth(const QDate &month)
 {
-    QDir().mkpath(m_dir);
+    // A directory that cannot be created means every later save fails, and usage history is the one
+    // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
+    if (!QDir().mkpath(m_dir))
+        qWarning("Flowbit: could not create the history directory %s - usage will not be saved",
+                 qPrintable(m_dir));
 
     const QString prefix = month.toString(QStringLiteral("yyyy-MM"));
     QJsonArray days;
@@ -403,7 +407,11 @@ void UsageTracker::loadMonth(const QDate &month)
 
 void UsageTracker::storeMonth(const QDate &month)
 {
-    QDir().mkpath(m_dir);
+    // A directory that cannot be created means every later save fails, and usage history is the one
+    // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
+    if (!QDir().mkpath(m_dir))
+        qWarning("Flowbit: could not create the history directory %s - usage will not be saved",
+                 qPrintable(m_dir));
 
     QJsonArray days;
     const QString prefix = month.toString(QStringLiteral("yyyy-MM"));

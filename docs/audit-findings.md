@@ -255,6 +255,40 @@ assertions with no failures, and `logman query -ets` shows **no Flowbit session 
 
 ---
 
+
+---
+
+# Pass 5: silent failures
+
+## F11 — A failed settings save looked like success (MEDIUM)
+
+`m_store->save(...)` returns a bool and an error string. Twenty call sites existed; **twelve
+discarded both**. Saving the theme, a window geometry, an update preference or the billing-cycle
+reset could fail - full disk, a read-only profile, an antivirus holding the file - and the UI showed
+the new value while `settings.json` kept the old one. The change then reverted at the next launch
+with nothing anywhere explaining it.
+
+The pattern was already right in six places (`if (!m_store->save(settings, &error))` with a status
+message). Everything now goes through `MainWindow::persistSettings()`, which reports the failure on
+the status bar and in the log, naming what could not be saved. `onResetCycle()` returns early on
+failure so the cycle is not displayed as reset when its date was never stored.
+
+`UsageTracker` had the same shape one level down: `QDir().mkpath(m_dir)` was called and discarded in
+two places, and a directory that cannot be created makes every later save fail - history is the one
+thing that cannot be reconstructed from anywhere else. Both are now reported.
+
+`test_silent_failures` walks every `m_store->save(` line in the source and fails if one discards its
+result (6 inline-checked, 0 unchecked), so the pattern cannot creep back.
+
+## Note on method
+
+Two of the fixes in this pass were first written with quoting that broke the Python patch script, so
+the edits silently did not apply - and the build "passed" because it compiled unchanged sources. The
+`make exit: 0` line was true and meaningless. The replacement counts (`20 -> 8`, then `6`) are what
+caught it; a build result alone would not have.
+
+---
+
 ## Updated plan status
 
 | Finding | Severity | Status |
@@ -269,6 +303,7 @@ assertions with no failures, and `logman query -ets` shows **no Flowbit session 
 | F8 unbounded rate cast, day mask | MEDIUM | fixed, tested |
 | F9 unbounded history growth | LOW | fixed, tested |
 | F10 ETW handle closed under ProcessTrace, running QThread deleted | HIGH | fixed, tested |
+| F11 failed settings saves reported as success | MEDIUM | fixed, tested |
 
 ---
 
