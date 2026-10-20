@@ -2888,7 +2888,17 @@ void MainWindow::refreshStatistics()
 
     // The per-application table, busiest first over the whole cycle.
     if (m_appUsageTable) {
-        const QVector<UsageTracker::AppUsage> apps = m_usage->appUsageOverDays(30);
+        // The window is the CYCLE, not a fixed 30 days.
+        //
+        // The panel's own caption says "over the current cycle", and the remainder row below is
+        // computed against the cycle totals - so asking for a 30-day window made the two disagree
+        // whenever the cycle is not exactly 30 days: a shorter cycle included days from before it
+        // (row totals too large, remainder clamped to zero, real gap hidden), a longer one silently
+        // dropped days. Both windows are the cycle now.
+        const int cycleDays = qMax(1, UsageTracker::cycleStartDate(settings.usage)
+                                          .daysTo(QDate::currentDate())
+                                      + 1);
+        const QVector<UsageTracker::AppUsage> apps = m_usage->appUsageOverDays(cycleDays);
         // The toggle only makes sense when there is something hidden behind it.
         if (m_appUsageMore) {
             m_appUsageMore->setVisible(apps.size() > 10);

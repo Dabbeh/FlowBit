@@ -247,6 +247,13 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
     else
         dUp = upBytes;
 
+    // Bounded: one entry per executable ever seen, across every restart, was unbounded. A machine
+    // that runs a lot of short-lived tools (installers, updaters, portable apps) accumulates them
+    // for the life of the process. Clearing wholesale is safe - the next sample for each path simply
+    // becomes its own baseline, which costs at most one interval of accuracy for paths not seen since
+    // the clear.
+    if (m_lastAppBytes.size() > 512 && !m_lastAppBytes.contains(path))
+        m_lastAppBytes.clear();
     m_lastAppBytes.insert(path, qMakePair(downBytes, upBytes));
 
     // A single sample cannot legitimately exceed this. Anything larger is a restart artefact or a
