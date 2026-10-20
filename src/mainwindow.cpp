@@ -194,6 +194,19 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
     });
     m_appRefreshTimer->start();
 
+    // Monitoring starts with the APPLICATION, not with the panel being expanded.
+    //
+    // It used to start only when the activity panel was first shown, so that a collapsed dashboard
+    // cost nothing. That decision made the per-application usage table wrong by design: the table
+    // is filled from the monitor's snapshot, so it recorded only the traffic that happened while
+    // the panel happened to be expanded - which is why "Usage by Application" under-reported and
+    // why Diagnostics can read "monitor not running" on a machine that is busy.
+    //
+    // The cost is bounded and already paid for: the ETW schema is cached per event id (that was the
+    // measured CPU cost), and the aggregation is a hash update per event.
+    if (m_appMonitor)
+        m_appMonitor->startAsync();
+
     // Per-application schedule windows open and close on wall-clock time, so the
     // active set is recomputed periodically. The interval is coarse on purpose: a
     // window boundary is a minute-resolution event, and this must cost nothing

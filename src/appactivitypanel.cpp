@@ -305,8 +305,13 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
             setMinimumHeight(0);
             setMaximumHeight(QWIDGETSIZE_MAX);
 
-            // The collapse has finished, so nothing is animating any more: the
-            // safe moment to tear the trace session down.
+            // Collapsing NO LONGER tears the trace session down.
+            //
+            // It used to, to keep a collapsed dashboard free. But per-application usage is recorded
+            // from the monitor's snapshot, so stopping it here meant the usage table only counted
+            // traffic while the panel was open - the totals were low by design. The monitor now
+            // runs for as long as the application does; m_stopMonitorWhenCollapsed remains as a
+            // flag other code can set, and is honoured below only if someone sets it deliberately.
             if (m_stopMonitorWhenCollapsed && m_monitor) {
                 m_stopMonitorWhenCollapsed = false;
                 QTimer::singleShot(0, this, [this] {
@@ -434,8 +439,8 @@ void AppActivityPanel::setExpanded(bool expanded)
         // empty until the next start finished.
         m_stopMonitorWhenCollapsed = false;
 
-        // Monitoring starts only when the panel is first shown, so a collapsed
-        // dashboard costs nothing. Asynchronous: even a wedged ETW leftover can
+        // The monitor is started by the window at startup, so this is only a safety net for the
+        // case where it was stopped for some other reason. Asynchronous: even a wedged ETW leftover can
         // hold the bounded cleanup workers, never this panel.
         if (m_monitor && !m_monitor->isRunning())
             m_monitor->startAsync();
