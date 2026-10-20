@@ -382,11 +382,18 @@ void AppMonitor::Impl::stopSession()
 {
     stopping.store(true);
 
-    if (traceHandle != INVALID_PROCESSTRACE_HANDLE) {
-        CloseTrace(traceHandle);
-        traceHandle = INVALID_PROCESSTRACE_HANDLE;
-    }
-
+    // THE ORDER HERE IS THE WHOLE POINT, and it used to be wrong.
+    //
+    // ProcessTrace() is a blocking call running on the consumer thread, and it holds the trace
+    // handle for as long as it runs. CloseTrace() frees that handle's control block. The old code
+    // closed the handle FIRST and joined the thread afterwards, which meant the consumer was still
+    // inside ProcessTrace while the handle it was using had already been freed - a use-after-close
+    // against the ETW runtime, and exactly the shape of an intermittent crash on collapse.
+    //
+    // The documented order is the reverse:
+    //   1. stop the session   - this is what makes ProcessTrace return
+    //   2. wait for the consumer thread, so ProcessTrace has actually returned
+    //   3. close the trace handle, now that nothing is using it
     if (sessionOwned && session != 0) {
         // StopTrace blocks until the consumer has drained.
         StopTraceW(session, sessionNameInUse(), nullptr);
@@ -399,10 +406,26 @@ void AppMonitor::Impl::stopSession()
 
     if (thread) {
         thread->quit();
-        thread->wait(3000);
-        delete thread;
-        thread = nullptr;
+        if (thread->wait(5000)) {
+            delete thread;
+            thread = nullptr;
+        } else {
+            // Still inside ProcessTrace. Deleting a running QThread destroys the thread object
+            // under a live stack frame, so the object is deliberately left in place: the thread
+            // exits when the session stop is observed, and the handle below is NOT closed while it
+            // may still be in use. A leaked QThread object is the lesser fault by a wide margin.
+            qWarning("Flowbit: the ETW consumer thread did not stop within 5s; leaving its handle "
+                     "open rather than closing it under a running ProcessTrace");
+            stopping.store(false);
+            return;
+        }
     }
+
+    if (traceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(traceHandle);
+        traceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+
     stopping.store(false);
 }
 

@@ -207,6 +207,54 @@ gone — the assertion failed, the parse was inspected, the offset was fixed. A 
 
 ---
 
+
+---
+
+# Pass 4: resource lifetime and shutdown ordering
+
+## F10 — The ETW consumer's trace handle was closed under a running ProcessTrace (HIGH)
+
+`AppMonitor::Impl::stopSession()` did this, in this order:
+
+```cpp
+CloseTrace(traceHandle);   // frees the handle
+...
+thread->wait(3000);        // consumer is still inside ProcessTrace
+delete thread;             // ...even if the wait timed out
+```
+
+Two faults in five lines, both undefined behaviour:
+
+1. **Use-after-close.** `ProcessTrace()` blocks on the consumer thread and holds the trace handle
+   for as long as it runs; `CloseTrace()` releases that handle's control block. The old order freed
+   it while the consumer was still using it. This is precisely the shape of a crash that happens
+   "sometimes" when the activity panel collapses - and it matches the panel's history of being the
+   one component reported as laggy and unstable.
+2. **Deleting a running QThread.** The result of `wait(3000)` was discarded, so a slow stop deleted
+   the thread object while its stack frame was still live.
+
+The documented order is the reverse — stop the session (which is what makes `ProcessTrace` return),
+join the consumer, and only then close the handle. The fix does exactly that, checks the join
+result, and on timeout deliberately leaves the thread object and the handle alone: a leaked
+`QThread` is a far smaller fault than either of the above, and the log says why.
+
+Verified with real sessions: the monitor suite starts and stops ETW sessions 118 times' worth of
+assertions with no failures, and `logman query -ets` shows **no Flowbit session left behind**.
+`test_etw_teardown` asserts the three-step order and the guarded delete (9 checks).
+
+## Checked and sound in pass 4
+
+| Item | Evidence |
+|---|---|
+| `OpenProcess` handles | every site opens, uses, closes on all paths; `sweepDeadPids` closes before erasing |
+| Shell icons | `SHGetFileInfoW` result's `HICON` is `DestroyIcon`'d immediately, and `pruneIconCache` bounds the cache |
+| WinDivert handles | startup failure paths close the flow handle before returning; `shutdown()` closes both and nulls them; workers publish their handle so teardown can shut it down |
+| Worker threads | `flowThread`/`netThread`/`tableThread` joined in `shutdown()`; throttle workers `join()`ed after `WinDivertShutdown(RECV)` unblocks them |
+| Updater | `QNetworkReply` deleted in its finished handler; staged `QFile` deleted on the failure path |
+| Service handles | all `OpenSCManager`/`OpenService` pairs close before every return, including the repair path |
+
+---
+
 ## Updated plan status
 
 | Finding | Severity | Status |
@@ -220,6 +268,7 @@ gone — the assertion failed, the parse was inspected, the offset was fixed. A 
 | F7 pacer data race | HIGH | fixed, tested |
 | F8 unbounded rate cast, day mask | MEDIUM | fixed, tested |
 | F9 unbounded history growth | LOW | fixed, tested |
+| F10 ETW handle closed under ProcessTrace, running QThread deleted | HIGH | fixed, tested |
 
 ---
 
