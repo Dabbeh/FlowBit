@@ -1,4 +1,4 @@
-# Captures a real stack trace for the intermittent Show Less crash.
+﻿# Captures a real stack trace for the intermittent Show Less crash.
 #
 # Why this approach: seven crash dumps exist and six of them fault at the exact same
 # place, Qt6Core.dll +0x216851, which disassembles to
@@ -66,3 +66,4 @@ if (Test-Path $out) {
 } else {
     Write-Host "No trace produced (gdb may not have been allowed to run elevated)." -ForegroundColor Red
 }
+

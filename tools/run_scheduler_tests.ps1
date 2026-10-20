@@ -1,4 +1,4 @@
-# Builds and runs the UI bug regression suite.
+﻿# Builds and runs the UI bug regression suite.
 #
 # Constructs the real MainWindow and the custom widgets on Qt's "offscreen"
 # platform, so no display is needed. Each check is written to fail against the
@@ -83,7 +83,7 @@ Write-Host '==> building test_scheduler' -ForegroundColor Cyan
     "-I$qt\include" "-I$qt\include\QtCore" "-I$qt\include\QtGui" "-I$qt\include\QtWidgets" "-I$qt\include\QtSvg" "-I$qt\include\QtNetwork" `
     "-I$qt\mkspecs\win32-g++" `
     @sources -o $exe "-L$qt\lib" -ladvapi32 -ldwmapi -ltdh -lwintrust -lcrypt32 -lQt6Svg -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network "-L$winder" -lwindivert `
-    -liphlpapi -lws2_32 -lshell32 -lmingw32
+    -lwinmm -liphlpapi -lws2_32 -lshell32 -lmingw32
 if ($LASTEXITCODE -ne 0) { throw 'test_scheduler failed to compile' }
 
 # Stage the Qt runtime beside the test, or it dies with STATUS_DLL_NOT_FOUND.
@@ -119,3 +119,4 @@ if (Test-Path $results) { Get-Content $results | ForEach-Object { Write-Host $_ 
 
 if ($rc -ne 0) { throw "test_scheduler reported failures (exit $rc)" }
 Write-Host "`ntest_scheduler passed." -ForegroundColor Green
+

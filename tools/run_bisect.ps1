@@ -1,4 +1,4 @@
-# Builds and runs the headless UI smoke test.
+﻿# Builds and runs the headless UI smoke test.
 #
 # Constructs the real MainWindow on Qt's "offscreen" platform, so no display is
 # needed and no window ever appears. Verifies the four zones lay out with sane
@@ -84,7 +84,7 @@ $winder = "$root\third_party\WinDivert\WinDivert-2.2.2-A\x64"
     "-I$qt\include" "-I$qt\include\QtCore" "-I$qt\include\QtGui" "-I$qt\include\QtWidgets" "-I$qt\include\QtSvg" "-I$qt\include\QtNetwork" `
     "-I$qt\mkspecs\win32-g++" `
     @sources -o $exe "-L$qt\lib" -ladvapi32 -ldwmapi -ltdh -lwintrust -lcrypt32 -lQt6Svg -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network "-L$winder" -lwindivert `
-    -liphlpapi -lws2_32 -lshell32 -lmingw32
+    -lwinmm -liphlpapi -lws2_32 -lshell32 -lmingw32
 if ($LASTEXITCODE -ne 0) { throw 'bisect failed to compile' }
 
 # The exe needs Qt's runtime DLLs and the offscreen platform plugin beside it;
@@ -133,3 +133,4 @@ if ($rc -ne 0) {
     throw "bisect reported failures (exit $rc)"
 }
 Write-Host "`nbisect passed." -ForegroundColor Green
+
