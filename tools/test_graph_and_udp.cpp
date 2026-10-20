@@ -31,7 +31,9 @@ int main(int argc, char *argv[])
     {
         const auto k = etwclass::classify(L"KNetEvt_TcpSend", 10);
         check(k.transfer && k.send && !k.udp && !k.retransmit, "TcpSend is a send, not UDP");
-        check(k.fromName, "and was classified by name");
+        // Ids are now the primary rule, so a known id must NOT be reported as name-classified:
+        // that flag means "the id table did not know this one".
+        check(!k.fromName, "and was classified by its id, not by the name");
     }
     {
         const auto k = etwclass::classify(L"KNetEvt_TcpRecv", 11);
@@ -104,6 +106,24 @@ int main(int argc, char *argv[])
         check(b.transfer && b.udp && !b.send, "and the received form classifies as a receive");
         const auto c = etwclass::classify(L"KNetEvt_SendIPV4Udp", 42);
         check(c.transfer && c.udp && c.send, "the CamelCase symbol classifies identically");
+    }
+
+
+    // ---- the regression that shipped for an hour ------------------------
+    //
+    // The provider names its TCP events "Data_sent_" / "Data_received_": no "tcp" anywhere. A
+    // name-first classifier that demanded a protocol word rejected every event, and Diagnostics
+    // showed an active session with 0 events after 78s. Ids must win.
+    {
+        const auto a = etwclass::classify(L"Data_sent_", 10);
+        const auto b = etwclass::classify(L"Data_received_", 11);
+        const auto c = etwclass::classify(L"Data_retransmitted_", 14);
+        check(a.transfer && a.send && !a.udp, "id 10 wins over the protocol-less name \"Data_sent_\"");
+        check(b.transfer && !b.send, "id 11 is a receive despite \"Data_received_\" saying nothing");
+        check(c.transfer && c.retransmit, "id 14 is still a retransmission");
+        // And a UDP id with the same style of name must still be UDP.
+        const auto d = etwclass::classify(L"Data_sent_over_UDP_protocol_", 42);
+        check(d.transfer && d.udp && d.send, "id 42 stays UDP send whatever the name says");
     }
 
     std::printf("\n== graph averages ==\n");

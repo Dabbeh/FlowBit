@@ -60,33 +60,14 @@ Kind classify(const wchar_t *name, unsigned short id)
 {
     Kind kind;
 
-    if (name && *name) {
-        kind.fromName = true;
-
-        const bool tcp = contains(name, L"tcp");
-        const bool udp = contains(name, L"udp");
-        if (!tcp && !udp)
-            return kind;   // not a transport event we account for
-
-        if (contains(name, L"retransmit")) {
-            // TCP only, and never counted: the bytes were counted when first sent.
-            kind.transfer = true;
-            kind.retransmit = true;
-            return kind;
-        }
-
-        const bool send = contains(name, L"send") || contains(name, L"sent");
-        const bool recv = contains(name, L"recv") || contains(name, L"receiv");
-        if (!send && !recv)
-            return kind;   // connect / disconnect / copy / failure: no bytes counted
-
-        kind.transfer = true;
-        kind.send = send;
-        kind.udp = udp;
-        return kind;
-    }
-
-    // No name: the id table.
+    // IDS FIRST. They are authoritative and were confirmed against Microsoft's generated mapping
+    // of this provider, so they cannot be misread.
+    //
+    // The name is only a FALLBACK for an id this table does not know, and that order matters.
+    // Classifying by name first broke event counting outright on the reporting machine: the
+    // provider's manifest names its TCP events "Data_sent_" and "Data_received_" - no "tcp" in the
+    // text - so a name-first rule that requires a protocol word rejected EVERY event, and
+    // Diagnostics showed an active session with 0 events after 78 seconds of monitoring.
     switch (id) {
     case kTcpSend:
     case kTcpIpv6Send:
@@ -114,8 +95,31 @@ Kind classify(const wchar_t *name, unsigned short id)
         kind.udp = true;
         return kind;
     default:
+        break;   // unknown id: fall through to the name
+    }
+
+    if (!name || !*name)
+        return kind;
+
+    kind.fromName = true;
+
+    if (contains(name, L"retransmit")) {
+        kind.transfer = true;
+        kind.retransmit = true;
         return kind;
     }
+
+    const bool send = contains(name, L"send") || contains(name, L"sent");
+    const bool recv = contains(name, L"recv") || contains(name, L"receiv");
+    if (!send && !recv)
+        return kind;   // connect / disconnect / copy / failure: no bytes counted
+
+    kind.transfer = true;
+    kind.send = send;
+    // Only claim a protocol when the name actually says so; "Data_sent_" says nothing and must
+    // not be guessed at.
+    kind.udp = contains(name, L"udp");
+    return kind;
 }
 
 } // namespace etwclass
