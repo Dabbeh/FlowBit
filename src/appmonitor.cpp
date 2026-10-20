@@ -184,6 +184,14 @@ public:
     std::atomic<bool> consumerExited{false};
     std::atomic<int> consumerRestarts{0};
 
+    // How the provider enable went, and whether the one-shot re-enable fired.
+    //
+    // A session can accept an enable and still deliver nothing; recording the code and the attempt
+    // count is what separates "never enabled" from "enabled and silent" in the report.
+    std::atomic<quint32> providerEnableRc{0};
+    std::atomic<int> providerEnableAttempts{0};
+    std::atomic<bool> reenableTried{false};
+
     // Counts events so the UI can tell "session running, no traffic" apart from
     // "session running but delivering nothing".
     std::atomic<quint64> eventsSeen{0};
@@ -390,6 +398,11 @@ public:
     ~Impl() { stopSession(); }
 
     void stopSession();
+    ULONG enableProvider();
+
+    // Seconds this session has been up. Used to decide when "no events yet" stops being normal.
+    int tickCount = 0;
+    int consumerSeconds() const { return tickCount; }
     bool startSession(QString *why);
 
     // Aggregation.
@@ -401,6 +414,18 @@ public:
                            const QHash<quint32, quint64> &outDelta);
     void sweepDeadPids();
 };
+
+ULONG AppMonitor::Impl::enableProvider()
+{
+    const ULONG rc = EnableTraceEx2(session, &kKernelNetworkProvider,
+                                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                    TRACE_LEVEL_VERBOSE,
+                                    0xFFFFFFFFFFFFFFFFULL,   // any keyword
+                                    0, 0, nullptr);
+    providerEnableRc.store(rc);
+    providerEnableAttempts.fetch_add(1);
+    return rc;
+}
 
 void AppMonitor::Impl::stopSession()
 {
@@ -1351,35 +1376,12 @@ bool AppMonitor::Impl::startSession(QString *why)
     // some builds the kernel-network events are emitted at level 5 and an
     // INFORMATION-level session silently filters them out (observed: session
     // running, counters zero, traffic active).
-    const ULONG enableRc = EnableTraceEx2(session, &kKernelNetworkProvider,
-                                          EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                          TRACE_LEVEL_VERBOSE,
-                                          0xFFFFFFFFFFFFFFFFULL,   // any keyword
-                                          0, 0, nullptr);
-    if (enableRc != ERROR_SUCCESS) {
-        // Reported to the debug log rather than to the user: the note shown under the table
-        // says what the fallback costs, and the number is in the diagnostics report.
-        qInfo("Flowbit: the kernel network provider would not enable (error %lu), "
-              "falling back to TCP EStats",
-              static_cast<unsigned long>(enableRc));
-        StopTraceW(session, sessionNameInUse(), nullptr);
-        session = 0;
-        sessionOwned = false;
-        if (why)
-            // One short sentence, and no error number.
-            //
-            // The wording has now been wrong in both directions. "Could not be enabled (error
-            // 1450)" described a handled fallback as a failure. Replacing it with four lines of
-            // explanation described it correctly and broke the layout: a note that long sets a
-            // minimum width on the panel, so the columns are pushed off the right edge even in a
-            // full-screen window.
-            //
-            // This is an annotation under a table. It says which source the figures came from
-            // and what that source does not see. The build of Windows, the error number and the
-            // word "unavailable" are all in the diagnostics report, which has room for them.
-            *why = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted on this system.");
-        return false;
-    }
+    // The provider is enabled AFTER the consumer is attached (see below): enabling it first is the
+    // documented trap, because the session's buffers fill with events that no consumer is draining.
+    // The comment that used to live here explains the level and keyword choice, which is unchanged:
+    // MatchAnyKeyword = 0 is the classic 'enable everything' call but was observed delivering zero
+    // events for this provider on the newest builds, and an INFORMATION-level session filters out
+    // the level-5 kernel-network events. Full keyword mask plus verbose level.
 
     // Open the real-time consumer.
     EVENT_TRACE_LOGFILEW logfile{};
@@ -1399,6 +1401,7 @@ bool AppMonitor::Impl::startSession(QString *why)
         return false;
     }
 
+    tickCount = 0;
     consumerExitCode.store(0);
     consumerExited.store(false);
 
@@ -1435,6 +1438,28 @@ bool AppMonitor::Impl::startSession(QString *why)
         }
     });
     thread->start();
+
+    // THE ORDER HERE IS THE POINT.
+    //
+    // Microsoft's Consuming Events documentation states that ProcessTrace blocks until the session
+    // stops or CloseTrace is called, and that a real-time session has exactly one consumer. It does
+    // not say when to enable the provider - and enabling it BEFORE a consumer exists is the
+    // documented trap: the session accepts the enable, its buffers fill with events nobody drains,
+    // and the consumer that arrives afterwards can sit at zero indefinitely. That is the reported
+    // symptom: session "active (this session)", 40s of monitoring, 0 events, no ids.
+    //
+    // The provider is therefore enabled once ProcessTrace is running. The short wait is on a worker
+    // thread (start() runs in startAsync's thread), so it costs the UI nothing.
+    QThread::msleep(50);
+    const ULONG enableRc = enableProvider();
+    if (enableRc != ERROR_SUCCESS) {
+        qInfo("Flowbit: the kernel network provider would not enable (error %lu), falling back to "
+              "TCP EStats", static_cast<unsigned long>(enableRc));
+        stopSession();
+        if (why)
+            *why = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted on this system.");
+        return false;
+    }
 
     return true;
 }
@@ -1714,11 +1739,24 @@ QString AppMonitor::consumerReport() const
     const QString restarts = m_impl->consumerRestarts.load() > 0
                                  ? QStringLiteral(", %1 restart(s)").arg(m_impl->consumerRestarts.load())
                                  : QString();
-    if (m_impl->consumerExited.load() && !m_impl->stopping.load())
-        return QStringLiteral("stopped (ProcessTrace %1)%2")
-            .arg(m_impl->consumerExitCode.load()).arg(restarts);
-    return m_impl->consumerExited.load() ? QStringLiteral("stopped") + restarts
-                                         : QStringLiteral("running") + restarts;
+    QString state = m_impl->consumerExited.load() && !m_impl->stopping.load()
+                        ? QStringLiteral("stopped (ProcessTrace %1)%2")
+                              .arg(m_impl->consumerExitCode.load())
+                              .arg(restarts)
+                        : (m_impl->consumerExited.load() ? QStringLiteral("stopped") + restarts
+                                                         : QStringLiteral("running") + restarts);
+
+    // The enable is reported alongside: "enabled and silent" and "never enabled" are different
+    // faults, and the code is the only thing that tells them apart.
+    const int attempts = m_impl->providerEnableAttempts.load();
+    if (attempts > 0) {
+        const quint32 rc = m_impl->providerEnableRc.load();
+        state += QStringLiteral(" \u00b7 enable %1, attempt %2%3")
+                     .arg(rc == 0 ? QStringLiteral("ok") : QString::number(rc))
+                     .arg(attempts)
+                     .arg(m_impl->reenableTried.load() ? QStringLiteral(", re-enabled after 5s") : QString());
+    }
+    return state;
 }
 
 QString AppMonitor::eventIdReport() const
@@ -1862,6 +1900,20 @@ void AppMonitor::startAsync()
 void AppMonitor::tick()
 {
 
+    // One-shot re-enable. A session can accept an enable and still deliver nothing - the enable can
+    // be swallowed when it lands while the consumer is still attaching, which is exactly what this
+    // ordering change is guarding against. Re-issuing ENABLE_PROVIDER once, after the consumer has
+    // provably had time to attach, costs nothing and has been the difference between a silent
+    // session and a working one. Deliberately once: a provider that still says nothing is a fact to
+    // report, not a call to loop on.
+    if (!m_impl->reenableTried.load() && state() == MonitorState::Running
+        && m_impl->eventsSeen.load() == 0 && m_impl->providerEnableAttempts.load() > 0
+        && m_impl->consumerSeconds() >= 5) {
+        m_impl->reenableTried.store(true);
+        qInfo("Flowbit: no events after 5s - re-enabling the provider once");
+        m_impl->enableProvider();
+    }
+
     // Self-recovery: a consumer that returned while the session is still wanted is rebuilt.
     //
     // Bounded to two attempts per process; beyond that the state is reported rather than retried
@@ -1931,7 +1983,8 @@ void AppMonitor::tick()
         m_impl->collectEstats();
 
     m_impl->completeInterval(seconds, seconds);
-    if (++m_tickCount % 20 == 0)
+    ++m_impl->tickCount;
+    if (m_tickCount % 20 == 0)
         m_impl->sweepDeadPids();
 
     emit updated();

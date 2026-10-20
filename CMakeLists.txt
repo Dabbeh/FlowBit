@@ -60,7 +60,6 @@ add_executable(Flowbit WIN32
     src/throttleengine.cpp
     src/throttleengine.h
     src/settings.h
-    src/settings.cpp
     src/schedule.h
     src/schedule.cpp
     src/settingsstore.h
@@ -123,9 +122,8 @@ target_link_directories(Flowbit PRIVATE "${WINDIVERT_ARCH_DIR}")
 target_link_libraries(Flowbit PRIVATE
     Qt6::Widgets
     Qt6::Svg
-    windivert        # WinDivert import library (WinDivert.lib
+    windivert        # WinDivert import library (WinDivert.lib)
     dwmapi
-)
     iphlpapi         # GetIfTable2 for live throughput
     ws2_32
     advapi32         # ETW session control (per-application monitoring)
