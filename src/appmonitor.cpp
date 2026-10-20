@@ -214,7 +214,7 @@ public:
     // count is what separates "never enabled" from "enabled and silent" in the report.
     std::atomic<quint32> providerEnableRc{0};
     std::atomic<int> providerEnableAttempts{0};
-    std::atomic<bool> reenableTried{false};
+    std::atomic<int> reenableCount{0};
 
     // Counts events so the UI can tell "session running, no traffic" apart from
     // "session running but delivering nothing".
@@ -1781,7 +1781,7 @@ QString AppMonitor::consumerReport() const
         state += QStringLiteral(" \u00b7 enable %1, attempt %2%3")
                      .arg(rc == 0 ? QStringLiteral("ok") : QString::number(rc))
                      .arg(attempts)
-                     .arg(m_impl->reenableTried.load() ? QStringLiteral(", re-enabled after 5s") : QString());
+                     .arg(m_impl->reenableCount.load() > 0 ? QStringLiteral(", re-enabled %1x").arg(m_impl->reenableCount.load()) : QString());
     }
     return state;
 }
@@ -1940,12 +1940,23 @@ void AppMonitor::tick()
     // provably had time to attach, costs nothing and has been the difference between a silent
     // session and a working one. Deliberately once: a provider that still says nothing is a fact to
     // report, not a call to loop on.
-    if (!m_impl->reenableTried.load() && state() == MonitorState::Running
-        && m_impl->eventsSeen.load() == 0 && m_impl->providerEnableAttempts.load() > 0
-        && m_impl->consumerSeconds() >= 5) {
-        m_impl->reenableTried.store(true);
-        qInfo("Flowbit: no events after 5s - re-enabling the provider once");
-        m_impl->enableProvider();
+    if (state() == MonitorState::Running && m_impl->eventsSeen.load() == 0
+        && m_impl->providerEnableAttempts.load() > 0) {
+        // Two attempts, at one second and at five.
+        //
+        // On the reporting machine the first enable - issued just after the consumer thread starts -
+        // was swallowed: the session ran and delivered nothing until a re-enable arrived. With the
+        // retry at five seconds that cost five seconds of no data and reported "attempt 2". One
+        // second is enough for the consumer to be inside ProcessTrace on every machine seen so far,
+        // so the rescue happens at the same moment the session becomes visible in the UI. The
+        // second retry at five seconds remains for a machine slower than that.
+        const int done = m_impl->reenableCount.load();
+        const int atSecond = (done == 0) ? 1 : 5;
+        if (done < 2 && m_impl->consumerSeconds() >= atSecond) {
+            m_impl->reenableCount.fetch_add(1);
+            qInfo("Flowbit: no events after %ds - re-enabling the provider (retry %d)", atSecond, done + 1);
+            m_impl->enableProvider();
+        }
     }
 
     // Self-recovery: a consumer that returned while the session is still wanted is rebuilt.
