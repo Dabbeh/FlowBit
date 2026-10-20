@@ -152,7 +152,78 @@ sweep for unguarded `quint64` subtraction was run first.
 
 ---
 
-## Plan, in priority order
+
+---
+
+# Pass 2 and 3: concurrency, then stored data
+
+## F7 — The pacer's rate was mutated from two threads without synchronisation (HIGH)
+
+`src/throttleengine.h` declared the pacer's state as plain `qint64`:
+
+```cpp
+qint64 m_rate = 0;  qint64 m_burst;  qint64 m_tokens;  Clock::time_point m_last;
+```
+
+`setRate()` is called from the GUI thread (`applimitengine.cpp:1005`, when rules are re-evaluated)
+while a packet worker sits in `waitFor()` reading and updating the same fields. That is a **data
+race**, which is undefined behaviour in C++ — not merely a value that might be one tick stale.
+
+What it could look like to a user: a limit that occasionally does not apply, a burst after changing
+a rate, or (theoretically) a torn 64-bit read. It would never reproduce on demand.
+
+**Fix**: all state is now behind a `std::mutex`, with the lock released for the sleep so a rate
+change never waits on a pacing slice. `refill()` became `refillLocked()` so it cannot be called
+without the lock. Verified by `test_pacer_race` — 400 concurrent rate changes while a worker paced,
+2.8 million packets through it, no hang, no negative rate, and switching to unlimited releases a
+waiting packet in 88ms instead of the multi-second deficit it was waiting out.
+
+**Checked and sound**: the limiter's `QHash` containers (`tupleOwner`, `buckets`). The worker takes
+the mutex, copies the `shared_ptr`, releases the lock, then uses it — so a rule change mid-packet
+cannot invalidate what the worker holds.
+
+## F8 — Rates were cast from `double` to `qint64` with no bounds (MEDIUM)
+
+`settingsstore.cpp` read every rate as `RateBps(o.value(...).toDouble(0))`. Converting a double that
+is negative, NaN, or outside `qint64`'s range is **undefined behaviour**; in practice it yields a
+large negative number, which the pacer treats as "unlimited" — a limit the user set silently stops
+working. A hand-edited or corrupted `settings.json` is enough.
+
+`clampRate()` now bounds every rate read to 0..100 Gbit/s, and `clampDays()` handles the weekday
+mask: 256 used to truncate to 0, i.e. "no days", which disabled a schedule with no visible cause.
+It clamps to all-days instead.
+
+## F9 — Usage history grew without limit (LOW)
+
+One file per month, written forever and never removed. Nothing in the UI can reach data older than
+the current cycle or the last 30 days. `pruneOldMonths()` keeps thirteen months and removes the
+rest on load.
+
+**Bug in my own fix, found by its test**: the first version split the filename on the *last* dash,
+which produces `04.json` from `apps-2026-04.json`, so every file failed to parse and nothing was
+ever pruned. The test caught it because it created a real 30-month-old file and asserted it was
+gone — the assertion failed, the parse was inspected, the offset was fixed. A structural check
+("the function exists") would have passed throughout.
+
+---
+
+## Updated plan status
+
+| Finding | Severity | Status |
+|---|---|---|
+| F1 unchecked packet injection | HIGH | fixed |
+| F2 GUI blocked on schtasks | HIGH | fixed |
+| F3 GUI blocked on monitor teardown | MEDIUM | fixed |
+| F4 unchecked permissions | MEDIUM | fixed |
+| F5 dead repair state | LOW | fixed |
+| F6 warnings | LOW | fixed |
+| F7 pacer data race | HIGH | fixed, tested |
+| F8 unbounded rate cast, day mask | MEDIUM | fixed, tested |
+| F9 unbounded history growth | LOW | fixed, tested |
+
+---
+
+## Plan, in priority order (original, kept for the record)
 
 1. **F1** — result-checked packet injection with bounded retry and a failure counter surfaced in
    diagnostics. This is the only finding that can silently break a user's connection.

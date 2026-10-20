@@ -112,6 +112,9 @@ private:
 
     // Per-app history, stored in its own file per month.
     void loadAppsMonth(const QDate &month);
+
+    // Deletes month files that no view can reach any more (see the implementation).
+    void pruneOldMonths();
     void storeAppsMonth(const QDate &month);
     QString fileForApps(const QDate &month) const;
     

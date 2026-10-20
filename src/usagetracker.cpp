@@ -58,6 +58,41 @@ QString UsageTracker::fileForApps(const QDate &month) const
         .arg(m_dir, month.toString(QStringLiteral("yyyy-MM")));
 }
 
+void UsageTracker::pruneOldMonths()
+{
+    // One file per month, written forever and never removed: the directory grew without limit for
+    // the life of the installation, holding per-application histories nobody can reach from the UI
+    // (the pages read the current cycle and the last 30 days).
+    //
+    // Twelve months is kept because that is the widest window any view can ask for, and a year is
+    // the obvious boundary for "how much did I use" questions. The current month is always kept.
+    constexpr int kKeepMonths = 13;
+
+    QDir dir(m_dir);
+    if (!dir.exists())
+        return;
+
+    const QDate oldest = QDate::currentDate().addMonths(-(kKeepMonths - 1));
+    const QStringList files = dir.entryList({QStringLiteral("apps-*.json"),
+                                             QStringLiteral("usage-*.json")},
+                                            QDir::Files);
+    for (const QString &name : files) {
+        // Both kinds are named <prefix>-yyyy-MM.json. Splitting on the LAST dash yields "04.json",
+        // because the month itself contains one - which made this prune skip every file, so the
+        // retention never actually deleted anything. Take the seven characters after the first
+        // dash instead.
+        const int dash = name.indexOf(QLatin1Char('-'));
+        if (dash < 0 || name.size() < dash + 8)
+            continue;
+        const QString monthText = name.mid(dash + 1, 7);
+        const QDate month = QDate::fromString(monthText, QStringLiteral("yyyy-MM"));
+        if (!month.isValid() || month >= oldest)
+            continue;
+        if (QFile::remove(dir.filePath(name)))
+            qInfo("Flowbit: removed old usage history %s", qPrintable(name));
+    }
+}
+
 void UsageTracker::loadAppsMonth(const QDate &month)
 {
     QFile file(fileForApps(month));
@@ -308,6 +343,8 @@ void UsageTracker::load(const UsageConfig &config)
     // than that.
     const QDate start = cycleStartDate(config);
     const QDate end = cycleEndDate(config);
+
+    pruneOldMonths();
 
     const QDate appFrom = qMin(start, QDate::currentDate().addDays(-6));
     QDate cursor(appFrom.year(), appFrom.month(), 1);
