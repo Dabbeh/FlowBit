@@ -152,7 +152,7 @@ void UsageTracker::loadAppsMonth(const QDate &month)
     }
 }
 
-void UsageTracker::storeAppsMonth(const QDate &month)
+bool UsageTracker::storeAppsMonth(const QDate &month)
 {
     // A directory that cannot be created means every later save fails, and usage history is the one
     // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
@@ -195,11 +195,14 @@ void UsageTracker::storeAppsMonth(const QDate &month)
     QSaveFile file(fileForApps(month));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning("Flowbit: could not write per-app usage %s", qPrintable(file.fileName()));
-        return;
+        return false;
     }
     file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
-    if (!file.commit())
+    if (!file.commit()) {
         qWarning("Flowbit: could not commit per-app usage %s", qPrintable(file.fileName()));
+        return false;
+    }
+    return true;
 }
 
 void UsageTracker::addAppSample(const QString &path, const QString &name,
@@ -405,7 +408,7 @@ void UsageTracker::loadMonth(const QDate &month)
     }
 }
 
-void UsageTracker::storeMonth(const QDate &month)
+bool UsageTracker::storeMonth(const QDate &month)
 {
     // A directory that cannot be created means every later save fails, and usage history is the one
     // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
@@ -436,11 +439,14 @@ void UsageTracker::storeMonth(const QDate &month)
     QSaveFile file(fileForMonth(month));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning("Flowbit: cannot write usage file %s", qPrintable(file.fileName()));
-        return;
+        return false;
     }
     file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
-    if (!file.commit())
+    if (!file.commit()) {
         qWarning("Flowbit: failed to commit usage file %s", qPrintable(file.fileName()));
+        return false;
+    }
+    return true;
 }
 
 void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
@@ -472,23 +478,38 @@ void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
     emit usageChanged();
 }
 
-void UsageTracker::flush()
+int UsageTracker::flush()
 {
-    for (const QString &monthKey : std::as_const(m_dirtyMonths)) {
+    // A month is only forgotten once it has actually been written.
+    //
+    // The old code cleared both dirty sets unconditionally after attempting the writes, so a
+    // failed write (full disk, a file held open, a permissions problem) dropped the month from the
+    // queue forever: the history was not just unsaved, it was never retried, and the 30-day view
+    // came back short with no way to know why. Failures now stay queued and the count is returned
+    // so a caller can say something.
+    int failed = 0;
+
+    const QSet<QString> months = m_dirtyMonths;
+    for (const QString &monthKey : months) {
         const QDate month = QDate::fromString(monthKey + QStringLiteral("-01"), Qt::ISODate);
-        if (month.isValid())
-            storeMonth(month);
+        if (!month.isValid() || storeMonth(month))
+            m_dirtyMonths.remove(monthKey);
+        else
+            ++failed;
     }
-    m_dirtyMonths.clear();
 
     // The per-app history is written from the same call and the same timer, so a
     // single flush leaves both files consistent with each other.
-    for (const QString &monthKey : std::as_const(m_appDaysDirty)) {
+    const QSet<QString> appMonths = m_appDaysDirty;
+    for (const QString &monthKey : appMonths) {
         const QDate month = QDate::fromString(monthKey + QStringLiteral("-01"), Qt::ISODate);
-        if (month.isValid())
-            storeAppsMonth(month);
+        if (!month.isValid() || storeAppsMonth(month))
+            m_appDaysDirty.remove(monthKey);
+        else
+            ++failed;
     }
-    m_appDaysDirty.clear();
+
+    return failed;
 }
 
 quint64 UsageTracker::cycleDownBytes() const

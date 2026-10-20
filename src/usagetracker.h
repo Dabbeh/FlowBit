@@ -40,7 +40,9 @@ public:
     void addSample(quint64 downBytes, quint64 upBytes);
 
     // Forces a write; called periodically and on shutdown.
-    void flush();
+    // Returns the number of months that could not be written; those stay queued and are
+    // retried on the next flush instead of being forgotten.
+    int flush();
 
     // True when there are unflushed changes.
     bool hasPendingWrites() const { return !m_dirtyMonths.isEmpty(); }
@@ -108,14 +110,14 @@ private:
     static QDate cycleEndDate(const UsageConfig &config);
     QString fileForMonth(const QDate &month) const;
     void loadMonth(const QDate &month);
-    void storeMonth(const QDate &month);
+    bool storeMonth(const QDate &month);
 
     // Per-app history, stored in its own file per month.
     void loadAppsMonth(const QDate &month);
 
     // Deletes month files that no view can reach any more (see the implementation).
     void pruneOldMonths();
-    void storeAppsMonth(const QDate &month);
+    bool storeAppsMonth(const QDate &month);
     QString fileForApps(const QDate &month) const;
     
     QString m_dir;

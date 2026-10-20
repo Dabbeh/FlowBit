@@ -289,7 +289,60 @@ caught it; a build result alone would not have.
 
 ---
 
-## Updated plan status
+
+---
+
+# Pass 6: shutdown ordering
+
+## F12 — A failed history write was retried never (MEDIUM)
+
+`UsageTracker::flush()` attempted the writes and then cleared `m_dirtyMonths` and
+`m_appDaysDirty` **unconditionally**. The two writers already logged their failures - and returned
+`void`, so the caller could not know. A month whose write failed was therefore dropped from the
+queue permanently: the data was not merely unsaved, it was never retried, and the 30-day view came
+back short with nothing anywhere explaining it. A full disk at the wrong moment lost a month of
+history silently.
+
+Both writers now return success, and `flush()` only forgets a month that was actually written -
+failures stay queued for the next flush and are returned as a count. `test_flush_retry` proves the
+sequence against a real blocked path: fail, fail again (still queued), then succeed and find the
+file on disk once the path is usable.
+
+## Shutdown ordering: checked and sound
+
+| Path | Evidence |
+|---|---|
+| `ThrottleEngine::~ThrottleEngine` | stops both workers, each `join()`ed after `WinDivertShutdown(RECV)` unblocks the receive |
+| `AppLimitEngine::~AppLimitEngine` | calls `shutdown()`: closes both handles (which unblocks receives), joins all three threads |
+| `AppMonitor::Impl::~Impl` | calls `stopSession()`, now in the correct stop -> join -> close order (F10) |
+| `main()` | `usage.flush()` runs after `app.exec()` returns; stack objects destruct in reverse order so the window (and its timer-driven flushes) go first |
+| Exit with a failed flush | no longer silent: F12 returns a count, and the writers log |
+
+---
+
+## Final status
+
+| Finding | Severity | Status |
+|---|---|---|
+| F1 unchecked packet injection | HIGH | fixed, tested |
+| F2 GUI blocked on schtasks | HIGH | fixed, tested |
+| F3 GUI blocked on monitor teardown | MEDIUM | fixed, tested |
+| F4 unchecked permissions | MEDIUM | fixed, tested |
+| F5 dead repair state | LOW | fixed |
+| F6 compiler warnings | LOW | fixed (0 warnings) |
+| F7 pacer data race | HIGH | fixed, tested |
+| F8 unbounded rate cast, day mask | MEDIUM | fixed, tested |
+| F9 unbounded history growth | LOW | fixed, tested |
+| F10 ETW handle closed under ProcessTrace, running QThread deleted | HIGH | fixed, tested |
+| F11 failed settings saves reported as success | MEDIUM | fixed, tested |
+| F12 failed history writes never retried | MEDIUM | fixed, tested |
+
+Verification: 0 compiler warnings across all sources; nine suites, **780 checks, 0 failures, no
+empty suites**; eight standalone suites (62 additional checks) covering every fix in this document.
+
+---
+
+## Updated plan status (historical)
 
 | Finding | Severity | Status |
 |---|---|---|
