@@ -91,7 +91,11 @@ QString formatBytes(double bytes, int decimals)
         double factor;
         const char *label;
     };
+    // TB and PB matter: without them an entry of 139 TB is printed as "142751.4 GB", which
+    // reads as a formatting bug rather than as a large number, and hides which magnitude it is.
     static const Entry entries[] = {
+        {kGi * 1024.0 * 1024.0, "PB"},
+        {kGi * 1024.0, "TB"},
         {kGi, "GB"}, {kMi, "MB"}, {kKi, "KB"}, {1.0, "B"},
     };
 

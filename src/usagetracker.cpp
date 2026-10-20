@@ -98,8 +98,20 @@ void UsageTracker::loadAppsMonth(const QDate &month)
             AppUsage u;
             u.path = path;
             u.name = o.value(QStringLiteral("name")).toString();
-            u.down = quint64(o.value(QStringLiteral("down")).toDouble());
-            u.up = quint64(o.value(QStringLiteral("up")).toDouble());
+            // Sanity filter on load, because a corrupted value that is already on disk would
+            // otherwise be displayed forever: the accumulation bug charged a whole cumulative
+            // total every second, which produced entries near 2^64 (one reached 8.6e18 bytes on a
+            // real machine). A single day cannot hold a petabyte for one application on any
+            // consumer machine, so anything at or above that is discarded rather than shown.
+            constexpr double kMaxPlausibleDay = 1.0e15;   // 1 PB
+            const double storedDown = o.value(QStringLiteral("down")).toDouble();
+            const double storedUp = o.value(QStringLiteral("up")).toDouble();
+            if (storedDown < 0 || storedUp < 0
+                || storedDown >= kMaxPlausibleDay || storedUp >= kMaxPlausibleDay)
+                continue;
+
+            u.down = quint64(storedDown);
+            u.up = quint64(storedUp);
             bucket.insert(path, u);
         }
     }
@@ -173,8 +185,36 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
         u.path = path;
     if (!name.isEmpty())
         u.name = name;      // refresh the display name as it is seen
-    u.down += downBytes;
-    u.up += upBytes;
+    // downBytes/upBytes are CUMULATIVE counters for this executable, not a delta.
+    //
+    // The previous code added them straight onto the running total, so every tick charged the
+    // whole history again. On a real machine that drove one entry to 8.6e18 bytes - just under
+    // 2^64, where the arithmetic wraps - and the Statistics page showed ~139 TB for a service
+    // host. Steam's row looked almost normal only because its cumulative total is small.
+    const QPair<quint64, quint64> previous = m_lastAppBytes.value(path, qMakePair<quint64, quint64>(0, 0));
+    quint64 dDown = 0;
+    quint64 dUp = 0;
+
+    if (downBytes >= previous.first)
+        dDown = downBytes - previous.first;
+    else
+        dDown = downBytes;      // counters restarted (monitor restarted): count what has accumulated
+
+    if (upBytes >= previous.second)
+        dUp = upBytes - previous.second;
+    else
+        dUp = upBytes;
+
+    m_lastAppBytes.insert(path, qMakePair(downBytes, upBytes));
+
+    // A single sample cannot legitimately exceed this. Anything larger is a restart artefact or a
+    // driver-level counter jump, and admitting it corrupts the stored history permanently.
+    constexpr quint64 kMaxSampleBytes = 64ull * 1024ull * 1024ull * 1024ull;   // 64 GiB
+    if (dDown > kMaxSampleBytes || dUp > kMaxSampleBytes)
+        return;
+
+    u.down += dDown;
+    u.up += dUp;
     m_appDaysDirty.insert(key.left(7));   // yyyy-MM
 }
 

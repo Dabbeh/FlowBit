@@ -124,6 +124,13 @@ private:
     QHash<QString, QHash<QString, AppUsage>> m_appDays;   // day ISO -> path -> usage
     QSet<QString> m_appDaysDirty;                         // months needing a write
 
+    // Last cumulative counters seen per executable, so a sample can be turned into a delta.
+    //
+    // The monitor reports CUMULATIVE bytes per application. Adding that number to a running total
+    // on every tick charges the whole history again each second, which is how one entry reached
+    // 8.6 quintillion bytes on a real machine - close to 2^64, where unsigned arithmetic wraps.
+    QHash<QString, QPair<quint64, quint64>> m_lastAppBytes;
+
     quint64 m_liveDown = 0;
     quint64 m_liveUp = 0;
     QDate m_today;
