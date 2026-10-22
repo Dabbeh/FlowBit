@@ -41,6 +41,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCloseEvent>
+#include <QElapsedTimer>
 #include <QComboBox>
 #include <QDate>
 #include <QDateTime>
@@ -3917,23 +3918,37 @@ void MainWindow::showEvent(QShowEvent *event)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    const Settings settings = m_store->load();
-    const bool quitting = !settings.closeToTray || m_quittingForUninstall;
-
-    // Take the window off the screen BEFORE the blocking work below.
+    // The window goes away FIRST, unconditionally, before anything that can block.
     //
-    // Quitting tears down two sessions synchronously: ThrottleEngine::detach() joins the packet
-    // workers, and AppMonitor::stop() waits for the ETW consumer to return. Together that is
-    // around a second with the UI thread blocked, and doing it while the window is still visible
-    // is exactly the "press X and it sits there frozen" report. Hiding first means the window is
-    // simply gone instead of frozen.
-    if (quitting)
-        hide();
+    // Every path through this function ends with the window hidden - either it is quitting, or
+    // it is heading for the tray - so hiding up front costs nothing and guarantees the user
+    // never watches a frozen window. It used to run a settings read, a usage flush and, on
+    // quit, a synchronous engine and ETW teardown with the window still on screen, which is
+    // the "press X and it sits there" report.
+    //
+    // The phases below are timed so that a report of "it still freezes" can be answered with a
+    // number instead of another guess. The lines go to OutputDebugString (see
+    // tools/debug_output_capture.cpp), which is the only channel a WIN32 GUI target has.
+    QElapsedTimer phase;
+    phase.start();
+    const auto mark = [&phase](const char *what) {
+        qInfo("Flowbit: close phase '%s' at %lld ms", what,
+              static_cast<long long>(phase.elapsed()));
+    };
+
+    hide();
+    mark("window hidden");
+
+    const Settings settings = m_store->load();
+    mark("settings loaded");
+
+    const bool quitting = !settings.closeToTray || m_quittingForUninstall;
 
     // Bank usage on the way out. Even when the app keeps running in the tray, the user may
     // well shut the machine down next, and the periodic checkpoint could be up to 30
     // seconds stale.
     m_usage->flush();
+    mark("usage flushed");
 
     // An uninstall closes the window whatever the tray setting says.
     //
@@ -3953,10 +3968,13 @@ void MainWindow::closeEvent(QCloseEvent *event)
         // engine is switched off rather than detached, which is its equivalent.
         if (m_engine)
             m_engine->detach();
+        mark("system-wide engine detached");
         if (m_appLimitEngine)
             m_appLimitEngine->setEnabled(false);
+        mark("application limiter released");
         if (m_appMonitor)
             m_appMonitor->stop();
+        mark("ETW monitor stopped");
 
         // A tray icon that outlives the window would be a way to reach an application that
         // is on its way out.
