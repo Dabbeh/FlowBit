@@ -26,6 +26,7 @@
 #include "usagetracker.h"
 #include "sidebar.h"
 #include "theme.h"
+#include "project_paths.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
@@ -66,10 +67,7 @@ void pump(int ms)
 
 QString source()
 {
-    QFile f(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/src/mainwindow.cpp"));
-    if (!f.open(QIODevice::ReadOnly))
-        return QString();
-    return QString::fromUtf8(f.readAll());
+    return project::read(QStringLiteral("src/mainwindow.cpp"));
 }
 
 } // namespace

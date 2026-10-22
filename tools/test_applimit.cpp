@@ -18,15 +18,18 @@
 #include "../src/schedule.h"
 #include "../src/settingsstore.h"
 #include "../src/throttleengine.h"
+#include "../src/units.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTextStream>
 
+#include <atomic>
 #include <cstdio>
 
 using namespace net;
@@ -253,6 +256,62 @@ int main(int argc, char *argv[])
         check(!AppLimitEngine::evaluate(r, at(2026, 3, 10, 12, 0)).active,
               "a Monday-only window is inactive on Tuesday");
 
+        // An overnight window carries its day mask into the next morning.
+        //
+        // The after-midnight tail belongs to the day the window STARTED on, so a Monday-only
+        // 22:00 -> 07:00 window covers Tuesday's small hours. Checking the mask against the
+        // current day instead stopped it dead at midnight: the window was configured, read
+        // correctly on screen, and never limited anything between 00:00 and 07:00.
+        Rule mondayNight;
+        mondayNight.id = 23;
+        mondayNight.from = QStringLiteral("22:00");
+        mondayNight.to = QStringLiteral("07:00");
+        mondayNight.days = 0x01;   // Monday only
+        r.windows.clear();
+        r.windows.append(mondayNight);
+
+        check(AppLimitEngine::evaluate(r, at(2026, 3, 9, 23, 0)).active,
+              "a Monday overnight window is active on Monday night");
+        check(AppLimitEngine::evaluate(r, at(2026, 3, 10, 3, 0)).active,
+              "and is still active in the small hours of Tuesday");
+        check(!AppLimitEngine::evaluate(r, at(2026, 3, 10, 7, 0)).active,
+              "and is released at its end time");
+        check(!AppLimitEngine::evaluate(r, at(2026, 3, 10, 23, 0)).active,
+              "Tuesday night is not covered by a Monday-only window");
+
+        // A window's own limits are applied while it is in force.
+        //
+        // The schedule dialog collects a download and an upload rate for every window and
+        // stores them; the engine used to evaluate the application's base rates instead, so a
+        // window given a tighter limit did nothing at all.
+        Rule cappedNight = mondayNight;
+        cappedNight.down = 32 * 1024;
+        cappedNight.up = 8 * 1024;
+        r.windows.clear();
+        r.windows.append(cappedNight);
+
+        const AppLimitState inWindow = AppLimitEngine::evaluate(r, at(2026, 3, 9, 23, 0));
+        check(inWindow.active && inWindow.down == 32 * 1024 && inWindow.up == 8 * 1024,
+              QStringLiteral("a window's own limits are applied (%1 down, %2 up)")
+                  .arg(inWindow.down)
+                  .arg(inWindow.up));
+
+        // A window left blank inherits the application's limits rather than disabling them:
+        // "+ Add Schedule" starts every new window at 0/0, so treating that as "unmetered"
+        // would silently uncap the application for the whole window.
+        Rule blankNight = mondayNight;
+        blankNight.down = kUnlimited;
+        blankNight.up = kUnlimited;
+        r.windows.clear();
+        r.windows.append(blankNight);
+
+        const AppLimitState inherited = AppLimitEngine::evaluate(r, at(2026, 3, 9, 23, 0));
+        check(inherited.active && inherited.down == r.down && inherited.up == r.up,
+              QStringLiteral("a window with no limits of its own uses the application's "
+                             "(%1 down, %2 up)")
+                  .arg(inherited.down)
+                  .arg(inherited.up));
+
         // Disabled rules never limit, whatever the schedule says.
         r.windows.clear();
         r.enabled = false;
@@ -311,6 +370,142 @@ int main(int argc, char *argv[])
         check(qMin(RateBps(kUnlimited), sysLimit) == kUnlimited
                   || qMin(RateBps(kUnlimited), sysLimit) == 0,
               "an application with no limit is bounded only by the system-wide cap");
+    }
+
+    // =====================================================================
+    // Download and upload are independent, in all three limiters
+    // =====================================================================
+    //
+    // Flowbit limits in three places and each has its own implementation:
+    //
+    //   1. the dashboard's system-wide cap      -> ThrottleEngine
+    //   2. the per-application cap              -> AppLimitEngine
+    //   3. schedules, which feed rates into 1   -> Settings::rules / AppRule::windows
+    //
+    // The contract is the same in all three: capping DOWNLOAD must leave UPLOAD alone when
+    // upload was not set. Capping one direction must never imply a cap on the other. This was
+    // genuinely broken once - a download cap throttled upload, because one packet worker
+    // served both directions and blocked the second while pacing the first - so it is checked
+    // per implementation rather than assumed from the one that was fixed.
+    logLine(QStringLiteral("== download and upload are independent =="));
+    {
+        const RateBps wanted = 200 * 1024;   // the reported case: 200 KB/s down, upload unset
+        const QDateTime night(QDate(2026, 10, 14), QTime(23, 0));   // inside 22:00-07:00
+
+        // ---- 0. the primitives -------------------------------------------
+        // An empty box has to become "unlimited", not zero bytes per second.
+        for (SpeedUnit u : allSpeedUnits()) {
+            check(toBytesPerSec(0.0, u) == kUnlimited,
+                  QStringLiteral("an empty %1 field means unlimited, not zero")
+                      .arg(speedUnitLabel(u)));
+        }
+        {
+            // Rate 0 must not wait at all: that is what makes "unlimited" actually unlimited
+            // rather than merely untracked. A 1500-byte packet is a full-size one.
+            Pacer free_rate(0);
+            std::atomic<bool> stop{false};
+            QElapsedTimer timer;
+            timer.start();
+            free_rate.waitFor(1500, stop, nullptr);
+            const qint64 elapsed = timer.elapsed();
+            check(elapsed < 20,
+                  QStringLiteral("a 0 B/s pacer releases a packet immediately (%1 ms)")
+                      .arg(elapsed));
+        }
+
+        // ---- 1. system-wide (dashboard) ----------------------------------
+        {
+            ThrottleEngine engine;
+            // No driver is opened here (this suite runs unelevated), so the workers fail and
+            // report; only the per-direction rate bookkeeping is under test.
+            QObject::connect(&engine, &ThrottleEngine::errorOccurred, &engine,
+                             [](const QString &) {});
+
+            engine.apply(wanted, kUnlimited);
+            check(engine.downBps() == wanted,
+                  QStringLiteral("dashboard: a 200 KB/s download cap is applied"));
+            check(engine.upBps() == kUnlimited,
+                  QStringLiteral("dashboard: upload is left unlimited, not capped to 200 KB/s"));
+            check(engine.isThrottling(), "dashboard: and the limiter reports as active");
+
+            engine.apply(kUnlimited, wanted);
+            check(engine.downBps() == kUnlimited,
+                  "dashboard: the reverse holds - download unlimited");
+            check(engine.upBps() == wanted, "dashboard: with only upload capped");
+
+            engine.detach();
+            check(engine.downBps() == kUnlimited && engine.upBps() == kUnlimited,
+                  "dashboard: detaching clears both directions");
+            check(!engine.isThrottling(), "dashboard: and reports itself off");
+        }
+
+        // ---- 2. schedule driving the system-wide cap ---------------------
+        {
+            Settings s;
+            s.enabled = true;
+            s.defaultDown = kUnlimited;
+            s.defaultUp = kUnlimited;
+
+            Rule nightCap;
+            nightCap.name = QStringLiteral("Night cap");
+            nightCap.from = QStringLiteral("22:00");
+            nightCap.to = QStringLiteral("07:00");
+            nightCap.down = wanted;
+            nightCap.up = kUnlimited;   // upload deliberately not set
+            s.rules.append(nightCap);
+
+            const EffectiveLimits during = evaluate(s, night);
+            check(during.down == wanted && during.up == kUnlimited,
+                  "schedule: a window that caps only download leaves upload unlimited");
+            check(during.throttling, "schedule: and still counts as limiting");
+
+            const EffectiveLimits outside = evaluate(s, QDateTime(QDate(2026, 10, 14), QTime(12, 0)));
+            check(outside.down == kUnlimited && outside.up == kUnlimited,
+                  "schedule: outside the window both directions are free");
+        }
+
+        // ---- 3. per-application cap --------------------------------------
+        {
+            AppRule r;
+            r.id = 90;
+            r.path = QStringLiteral("C:/test/browser.exe");
+            r.exe = QStringLiteral("browser.exe");
+            r.name = QStringLiteral("Browser");
+            r.down = wanted;
+            r.up = kUnlimited;
+
+            const AppLimitState s = AppLimitEngine::evaluate(r, night);
+            check(s.active, "app limiter: a rule capping only download is active");
+            check(s.down == wanted, "app limiter: its download cap is carried through");
+            check(s.up == kUnlimited, "app limiter: and upload stays unlimited");
+        }
+
+        // ---- 4. per-application scheduled window ------------------------
+        // The window supplies its own rate, so this is the one place the two directions could
+        // diverge per window rather than per rule.
+        {
+            AppRule r;
+            r.id = 91;
+            r.path = QStringLiteral("C:/test/launcher.exe");
+            r.exe = QStringLiteral("launcher.exe");
+            r.down = 4 * 1024 * 1024;    // a base rate that must be overridden
+            r.up = kUnlimited;
+
+            Rule window;
+            window.id = 92;
+            window.from = QStringLiteral("22:00");
+            window.to = QStringLiteral("07:00");
+            window.days = 0x7F;
+            window.down = wanted;
+            window.up = kUnlimited;
+            r.windows.append(window);
+
+            const AppLimitState s = AppLimitEngine::evaluate(r, night);
+            check(s.active && s.down == wanted,
+                  "app window: its own download cap replaces the application's");
+            check(s.up == kUnlimited,
+                  "app window: and upload stays unlimited rather than mirroring download");
+        }
     }
 
     // =====================================================================

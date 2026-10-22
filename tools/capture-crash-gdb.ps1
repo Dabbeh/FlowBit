@@ -18,8 +18,16 @@
 
 param(
     [string]$ExeDir = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Flowbit'),
-    [string]$DebugExe = 'C:\Users\enaya\Desktop\Flowbit-Source\build\debug\Flowbit.exe'
+    [string]$DebugExe = ''
 )
+
+# The debug build lives in the project this script belongs to. It used to be hard-coded to one
+# machine's Desktop under a directory name ("Flowbit-Source") that no longer exists, so the
+# script could only ever exit with "debug build missing". Resolved here rather than in the
+# parameter list so $PSScriptRoot is dependably set.
+if ([string]::IsNullOrEmpty($DebugExe)) {
+    $DebugExe = Join-Path (Split-Path -Parent $PSScriptRoot) 'build\debug\Flowbit.exe'
+}
 
 $gdb = 'C:\Qt\Tools\mingw1310_64\bin\gdb.exe'
 $out = Join-Path $ExeDir 'crash-gdb.txt'

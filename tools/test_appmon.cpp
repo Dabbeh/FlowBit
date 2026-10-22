@@ -21,6 +21,7 @@
 #include "../src/appactivitypanel.h"
 #include "../src/appmonitor.h"
 #include "../src/appnames.h"
+#include "../src/etwclass.h"
 #include "../src/theme.h"
 
 #include <QApplication>
@@ -129,6 +130,94 @@ int main(int argc, char *argv[])
         g_log = &logFile;
 
     theme::setMode(theme::Mode::Dark);
+
+    // =====================================================================
+    // Which provider event ids are counted, and which way each one points
+    // =====================================================================
+    //
+    // This is the part of the ETW path that has been wrong repeatedly, and the only part that
+    // can be checked without an elevated session. The failure it guards is quiet rather than
+    // loud: a decoder that accepts only the TCP ids counts working traffic, reports a healthy
+    // decode rate, and never mentions UDP - so QUIC, DNS, WireGuard and game traffic simply do
+    // not exist as far as the application list is concerned.
+    logLine(QStringLiteral("== provider event ids =="));
+    {
+        // Exercised through etwclass::classify - the classifier the decoder actually uses -
+        // rather than through a copy of its rules. A name is passed as null so the id fallback
+        // is what gets tested; the name-based path is exercised below.
+        const auto kind = [](unsigned short id) { return etwclass::classify(nullptr, id); };
+
+        // ---- TCP, both families ------------------------------------------
+        check(kind(10).transfer && kind(10).send, "10 (TCP send v4) is a transfer, outbound");
+        check(kind(11).transfer && !kind(11).send, "11 (TCP receive v4) is a transfer, inbound");
+        check(kind(14).transfer, "14 (TCP retransmit v4) is counted");
+        check(kind(26).transfer && kind(26).send, "26 (TCP send v6) is a transfer, outbound");
+        check(kind(27).transfer && !kind(27).send, "27 (TCP receive v6) is a transfer, inbound");
+        check(kind(30).transfer, "30 (TCP retransmit v6) is counted");
+
+        // ---- UDP, both families: this is what makes QUIC appear ----------
+        check(kind(42).transfer && kind(42).send && kind(42).udp,
+              "42 (UDP send v4) is a transfer, outbound, and known to be UDP");
+        check(kind(43).transfer && !kind(43).send && kind(43).udp,
+              "43 (UDP receive v4) is a transfer, inbound - QUIC download");
+        check(kind(58).transfer && kind(58).send && kind(58).udp,
+              "58 (UDP send v6) is a transfer, outbound");
+        check(kind(59).transfer && !kind(59).send && kind(59).udp,
+              "59 (UDP receive v6) is a transfer, inbound");
+
+        // ---- control events carry no bytes and must stay out -------------
+        check(!kind(12).transfer, "12 (TCP connect) is not counted");
+        check(!kind(13).transfer, "13 (TCP disconnect) is not counted");
+        check(!kind(17).transfer, "17 (TCP failure) is not counted");
+        check(!kind(0).transfer, "an unknown id is not counted");
+
+        // ---- TCP is not mistaken for UDP ---------------------------------
+        check(!kind(10).udp && !kind(11).udp, "TCP ids are not flagged as UDP");
+        check(!kind(14).transfer || kind(14).retransmit,
+              "the retransmit id is marked as such, so it can be counted separately");
+
+        // ---- the two halves must agree -----------------------------------
+        // An id treated as outbound but not counted would be a silent hole.
+        {
+            bool consistent = true;
+            int outbound = 0;
+            for (int id = 0; id < 128; ++id) {
+                const etwclass::Kind k = kind(static_cast<unsigned short>(id));
+                if (k.send) {
+                    ++outbound;
+                    if (!k.transfer)
+                        consistent = false;
+                }
+            }
+            check(consistent, "every id treated as outbound is also a transfer");
+            check(outbound == 4,
+                  QStringLiteral("exactly four ids upload: 10, 26, 42, 58 (%1)").arg(outbound));
+        }
+
+        // ---- retransmits are transfer events that must NOT add bytes -----
+        // A retransmission carries the size of data already counted when it was first sent, so
+        // adding it again inflates per-application usage above the traffic that actually moved.
+        // The decoder uses it as proof the source is alive and then returns.
+        check(kind(14).transfer && kind(14).retransmit,
+              "14 is a transfer AND marked retransmit, so the decoder can skip it");
+        check(kind(30).transfer && kind(30).retransmit,
+              "30 is a transfer AND marked retransmit");
+        check(!kind(14).send && !kind(30).send,
+              "retransmits are not given a direction, because they are never counted as bytes");
+
+        // ---- classification by NAME, which is how the decoder really works ----
+        // The manifest publishes no ids for UDP, so the name is the primary signal and the id
+        // table is only a fallback. These are the names TDH reports.
+        check(etwclass::classify(L"KNetEvt_SendIPV4Udp", 0).transfer
+                  && etwclass::classify(L"KNetEvt_SendIPV4Udp", 0).udp,
+              "a UDP send is recognised from its event name alone (id 0)");
+        check(etwclass::classify(L"KNetEvt_RecvIPV6Udp", 0).transfer
+                  && !etwclass::classify(L"KNetEvt_RecvIPV6Udp", 0).send,
+              "a UDP receive is recognised by name, and points inbound");
+        check(etwclass::classify(L"KNetEvt_SendIPV4Tcp", 0).transfer
+                  && !etwclass::classify(L"KNetEvt_SendIPV4Tcp", 0).udp,
+              "a TCP send is recognised by name and not confused with UDP");
+    }
 
     // =====================================================================
     // Rate arithmetic

@@ -154,10 +154,26 @@ public:
     QHash<quint64, std::shared_ptr<Buckets>> buckets;
 
     void *flowHandle = nullptr;
-    void *netHandle = nullptr;
+
+    // One NETWORK handle and one worker per direction, deliberately.
+    //
+    // A single handle with the filter "true" (both directions) and a single receive loop
+    // serialised the two: Pacer::waitFor blocks the thread that called it, so while an
+    // inbound packet was accruing download credit every outbound packet sat unread behind
+    // it in the same loop. The measured effect was that setting a download limit also
+    // throttled upload - the two directions shared one thread's timeline.
+    //
+    // Separate handles are what WinDivert requires anyway to run two pacing loops at one
+    // priority: handles sharing a layer and priority must use disjoint filters, and
+    // "inbound" / "outbound" are exactly disjoint. The system-wide engine already works
+    // this way.
+    void *netHandleIn = nullptr;
+    void *netHandleOut = nullptr;
+
     std::atomic<bool> stop{false};
     std::thread flowThread;
-    std::thread netThread;
+    std::thread netThreadIn;
+    std::thread netThreadOut;
     std::thread tableThread;
 
     // How process attribution is obtained. The FLOW layer is ideal but is not
@@ -191,9 +207,13 @@ void AppLimitEngine::Impl::shutdown()
 
     // Closing the handles makes the workers' blocking receives fail, which is the
     // only way to unblock them promptly.
-    if (netHandle) {
-        WinDivertClose(static_cast<HANDLE>(netHandle));
-        netHandle = nullptr;
+    if (netHandleIn) {
+        WinDivertClose(static_cast<HANDLE>(netHandleIn));
+        netHandleIn = nullptr;
+    }
+    if (netHandleOut) {
+        WinDivertClose(static_cast<HANDLE>(netHandleOut));
+        netHandleOut = nullptr;
     }
     if (flowHandle) {
         WinDivertClose(static_cast<HANDLE>(flowHandle));
@@ -202,8 +222,10 @@ void AppLimitEngine::Impl::shutdown()
 
     if (flowThread.joinable())
         flowThread.join();
-    if (netThread.joinable())
-        netThread.join();
+    if (netThreadIn.joinable())
+        netThreadIn.join();
+    if (netThreadOut.joinable())
+        netThreadOut.join();
     if (tableThread.joinable())
         tableThread.join();
 
@@ -233,13 +255,23 @@ bool AppLimitEngine::Impl::startup(QString *why)
     // PRIORITY 100: the system-wide ThrottleEngine holds NETWORK handles at
     // priority 0, and WinDivert requires handles that share a priority to use
     // mutually exclusive filters. A different priority sidesteps that rule.
-    netHandle = WinDivertOpen("true", WINDIVERT_LAYER_NETWORK, 100, 0);
+    //
+    // Two handles, one per direction, so each direction gets its own pacing loop. The
+    // previous single "true" handle forced both through one thread, which is why a download
+    // limit also throttled upload - see the netHandleIn/netHandleOut comment.
+    const auto openNetwork = [](const char *filter) -> void * {
+        const HANDLE h = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 100, 0);
+        return h == INVALID_HANDLE_VALUE ? nullptr : static_cast<void *>(h);
+    };
 
-    if (netHandle == INVALID_HANDLE_VALUE) {
-        // The driver refused this handle. Before reporting that, give the driver the same
+    netHandleIn = openNetwork("inbound");
+    netHandleOut = openNetwork("outbound");
+
+    if (!netHandleIn || !netHandleOut) {
+        // The driver refused a handle. Before reporting that, give the driver the same
         // repair the system-wide engine gives it.
         //
-        // This engine opens its OWN device handles - a NETWORK handle at priority 100, and a
+        // This engine opens its OWN device handles - NETWORK handles at priority 100, and a
         // FLOW handle - where the system-wide engine uses priority 0. A driver left in the
         // state an in-place update produces (service disabled, deletion pending, an instance
         // still resident) can satisfy the handle that is already open while refusing a fresh
@@ -261,16 +293,28 @@ bool AppLimitEngine::Impl::startup(QString *why)
 
             if (readiness == ThrottleEngine::DriverReadiness::Ready
                 || readiness == ThrottleEngine::DriverReadiness::Repaired) {
-                netHandle = WinDivertOpen("true", WINDIVERT_LAYER_NETWORK, 100, 0);
+                // Only the handle that was refused is retried; the other is already open and
+                // a second open of the same filter would collide with itself.
+                if (!netHandleIn)
+                    netHandleIn = openNetwork("inbound");
+                if (!netHandleOut)
+                    netHandleOut = openNetwork("outbound");
                 retried = true;
             }
         }
 
-        if (netHandle == INVALID_HANDLE_VALUE) {
-            netHandle = nullptr;
+        if (!netHandleIn || !netHandleOut) {
             // Report the error from the retry when one happened: it describes the state after
             // the repair, which is what the user is actually looking at.
             const DWORD err = GetLastError();
+            if (netHandleIn) {
+                WinDivertClose(static_cast<HANDLE>(netHandleIn));
+                netHandleIn = nullptr;
+            }
+            if (netHandleOut) {
+                WinDivertClose(static_cast<HANDLE>(netHandleOut));
+                netHandleOut = nullptr;
+            }
             if (flowHandle) {
                 WinDivertClose(static_cast<HANDLE>(flowHandle));
                 flowHandle = nullptr;
@@ -291,8 +335,10 @@ bool AppLimitEngine::Impl::startup(QString *why)
 
     // A deeper queue than the default keeps a burst from being dropped while the
     // pacer is holding packets back.
-    WinDivertSetParam(static_cast<HANDLE>(netHandle), WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
-    WinDivertSetParam(static_cast<HANDLE>(netHandle), WINDIVERT_PARAM_QUEUE_TIME, 2000);
+    for (void *h : {netHandleIn, netHandleOut}) {
+        WinDivertSetParam(static_cast<HANDLE>(h), WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
+        WinDivertSetParam(static_cast<HANDLE>(h), WINDIVERT_PARAM_QUEUE_TIME, 2000);
+    }
 
     return true;
 }
@@ -587,12 +633,34 @@ AppLimitState AppLimitEngine::evaluate(const AppRule &rule, const QDateTime &now
     s.matchedWindow = window;
     s.down = rule.down;
     s.up = rule.up;
+
+    // A matched window may name its own limits, and until now it could not: the schedule
+    // dialog collected a download and an upload rate for every window, stored them, and the
+    // engine then evaluated the application's base rates instead. The authored per-window
+    // limits were dead data.
+    //
+    // A direction the window specifies now wins. A window with BOTH directions unlimited
+    // inherits the application's limits rather than meaning "unmetered": the dialog cannot
+    // express a deliberate "unlimited" (a cleared box and a never-filled box look the same),
+    // and every window started with "+ Add Schedule" begins at 0/0. Treating those as
+    // overrides would silently uncap the application for the whole window, which is the
+    // opposite of what was configured.
+    if (window >= 0) {
+        const Rule &w = rule.windows.at(window);
+        if (w.down != kUnlimited || w.up != kUnlimited) {
+            if (w.down != kUnlimited)
+                s.down = w.down;
+            if (w.up != kUnlimited)
+                s.up = w.up;
+        }
+    }
+
     s.reason = alwaysOn ? QStringLiteral("Always on")
                         : QStringLiteral("Scheduled window active");
 
-    // A rule whose limits are both unlimited is configured but does nothing; saying
+    // A rule whose effective limits are both unlimited is configured but does nothing; saying
     // so is clearer than reporting an active rule with no effect.
-    if (rule.down == kUnlimited && rule.up == kUnlimited) {
+    if (s.down == kUnlimited && s.up == kUnlimited) {
         s.active = false;
         s.reason = QStringLiteral("No limits set");
     }
@@ -806,88 +874,107 @@ void AppLimitEngine::setEnabled(bool enabled)
             }
         });
 
-        // ---- network worker: paces only attributed packets ----------------
-        m_impl->netThread = std::thread([this, impl] {
-            std::vector<char> buffer(kMaxPacket);
-            while (!impl->stop.load()) {
-                UINT recvLen = 0;
-                WINDIVERT_ADDRESS addr{};
-                if (!WinDivertRecv(static_cast<HANDLE>(impl->netHandle), buffer.data(),
-                                   UINT(buffer.size()), &recvLen, &addr)) {
-                    if (GetLastError() == ERROR_NO_DATA)
-                        continue;
-                    break;
-                }
+        // ---- network workers: one per direction, each pacing only ----------
+        //
+        // Splitting these is the fix for "a download limit also limits upload".
+        //
+        // The loop below paces inline - Pacer::waitFor blocks the calling thread until the
+        // packet has accrued credit, in slices of up to kMaxSleepSliceMs. With one loop
+        // serving both directions, every outbound packet queued behind an inbound packet
+        // that was waiting on the download bucket, so upload throughput collapsed to
+        // whatever the download cap allowed. Neither direction's rate was wrong; they were
+        // simply sharing one thread's timeline.
+        //
+        // With a handle and a thread each, an inbound wait can no longer delay outbound
+        // traffic: the upload bucket decides upload pacing and nothing else.
+        const auto startPacketWorker = [this, impl](bool outbound) {
+            void *handle = outbound ? impl->netHandleOut : impl->netHandleIn;
+            std::thread &slot = outbound ? impl->netThreadOut : impl->netThreadIn;
 
-                quint64 ownerId = 0;
-                std::shared_ptr<Buckets> bucket;
+            slot = std::thread([this, impl, outbound, handle] {
+                std::vector<char> buffer(kMaxPacket);
+                while (!impl->stop.load()) {
+                    if (!handle)
+                        break;
 
-                PWINDIVERT_IPHDR ip = nullptr;
-                PWINDIVERT_IPV6HDR ip6 = nullptr;
-                PWINDIVERT_TCPHDR tcp = nullptr;
-                PWINDIVERT_UDPHDR udp = nullptr;
-                UINT8 protocol = 0;
-
-                if (WinDivertHelperParsePacket(buffer.data(), recvLen, &ip, &ip6, &protocol,
-                                               nullptr, nullptr, &tcp, &udp, nullptr, nullptr,
-                                               nullptr, nullptr)) {
-                    quint16 sport = 0;
-                    quint16 dport = 0;
-                    if (tcp) {
-                        sport = ntohs(tcp->SrcPort);
-                        dport = ntohs(tcp->DstPort);
-                    } else if (udp) {
-                        sport = ntohs(udp->SrcPort);
-                        dport = ntohs(udp->DstPort);
+                    UINT recvLen = 0;
+                    WINDIVERT_ADDRESS addr{};
+                    if (!WinDivertRecv(static_cast<HANDLE>(handle), buffer.data(),
+                                       UINT(buffer.size()), &recvLen, &addr)) {
+                        if (GetLastError() == ERROR_NO_DATA)
+                            continue;
+                        break;
                     }
 
-                    // Both families must be handled: previously only v4 packets
-                    // reached the tuple lookup, so IPv6 application traffic
-                    // silently escaped per-application limits (the system-wide
-                    // cap still applied, which made the gap easier to miss).
-                    FlowTuple key;
-                    if (ip) {
-                        key = normaliseTuple(ip->SrcAddr, sport, ip->DstAddr, dport,
-                                             protocol, addr.Outbound != 0);
-                    } else if (ip6) {
-                        key = normaliseV6Tuple(ip6->SrcAddr, sport, ip6->DstAddr, dport,
-                                               protocol, addr.Outbound != 0);
-                    } else {
-                        key.protocol = protocol;
-                    }
+                    std::shared_ptr<Buckets> bucket;
 
-                    {
+                    PWINDIVERT_IPHDR ip = nullptr;
+                    PWINDIVERT_IPV6HDR ip6 = nullptr;
+                    PWINDIVERT_TCPHDR tcp = nullptr;
+                    PWINDIVERT_UDPHDR udp = nullptr;
+                    UINT8 protocol = 0;
+
+                    if (WinDivertHelperParsePacket(buffer.data(), recvLen, &ip, &ip6, &protocol,
+                                                   nullptr, nullptr, &tcp, &udp, nullptr, nullptr,
+                                                   nullptr, nullptr)) {
+                        quint16 sport = 0;
+                        quint16 dport = 0;
+                        if (tcp) {
+                            sport = ntohs(tcp->SrcPort);
+                            dport = ntohs(tcp->DstPort);
+                        } else if (udp) {
+                            sport = ntohs(udp->SrcPort);
+                            dport = ntohs(udp->DstPort);
+                        }
+
+                        // Both families must be handled: previously only v4 packets
+                        // reached the tuple lookup, so IPv6 application traffic
+                        // silently escaped per-application limits (the system-wide
+                        // cap still applied, which made the gap easier to miss).
+                        FlowTuple key;
+                        if (ip) {
+                            key = normaliseTuple(ip->SrcAddr, sport, ip->DstAddr, dport,
+                                                 protocol, addr.Outbound != 0);
+                        } else if (ip6) {
+                            key = normaliseV6Tuple(ip6->SrcAddr, sport, ip6->DstAddr, dport,
+                                                   protocol, addr.Outbound != 0);
+                        } else {
+                            key.protocol = protocol;
+                        }
+
                         QMutexLocker lock(&impl->mutex);
                         const auto it = impl->tupleOwner.constFind(key);
                         if (it != impl->tupleOwner.constEnd()) {
-                            ownerId = it.value();
-                            const auto b = impl->buckets.constFind(ownerId);
+                            const auto b = impl->buckets.constFind(it.value());
                             if (b != impl->buckets.constEnd())
                                 bucket = b.value();
                         }
                     }
-                }
 
-                if (bucket) {
-                    if (addr.Outbound) {
-                        if (bucket->up.rate() > 0) {
-                            bucket->up.waitFor(recvLen, impl->stop);
-                            bucket->bytesUp.fetch_add(recvLen);
-                            m_pacedUp.fetch_add(1);
-                        }
-                    } else {
-                        if (bucket->down.rate() > 0) {
-                            bucket->down.waitFor(recvLen, impl->stop);
-                            bucket->bytesDown.fetch_add(recvLen);
-                            m_pacedDown.fetch_add(1);
+                    // Only this handle's own direction is paced, so the two buckets are
+                    // never consulted from the same thread.
+                    if (bucket) {
+                        Pacer &pacer = outbound ? bucket->up : bucket->down;
+                        if (pacer.rate() > 0) {
+                            pacer.waitFor(recvLen, impl->stop);
+                            if (outbound) {
+                                bucket->bytesUp.fetch_add(recvLen);
+                                m_pacedUp.fetch_add(1);
+                            } else {
+                                bucket->bytesDown.fetch_add(recvLen);
+                                m_pacedDown.fetch_add(1);
+                            }
                         }
                     }
-                }
 
-                WinDivertSend(static_cast<HANDLE>(impl->netHandle), buffer.data(), recvLen,
-                              nullptr, &addr);
-            }
-        });
+                    WinDivertSend(static_cast<HANDLE>(handle), buffer.data(), recvLen, nullptr,
+                                  &addr);
+                }
+            });
+        };
+
+        startPacketWorker(false);
+        startPacketWorker(true);
     } else {
         m_impl->shutdown();
         m_running.store(false);

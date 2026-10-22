@@ -97,6 +97,8 @@ add_executable(Flowbit WIN32
     src/responsivepair.cpp
     src/appmonitor.h
     src/appmonitor.cpp
+    src/etwclass.h
+    src/etwclass.cpp
     src/appnames.h
     src/appnames.cpp
     src/appactivitypanel.h

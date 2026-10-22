@@ -180,6 +180,24 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
     });
     m_appRefreshTimer->start();
 
+    // Monitoring starts with the APPLICATION, not with the panel being expanded.
+    //
+    // It used to start only when the activity panel was first shown, so that a collapsed
+    // dashboard cost nothing. That made the per-application figures wrong by design: the usage
+    // table is filled from the monitor's snapshot, so it recorded only traffic that happened
+    // while the panel happened to be open.
+    //
+    // It also produced a diagnostic that could not be explained from the app: "ETW session:
+    // works (StartTrace 0)" printed directly above "ETW events received: 0 (decoded: 0)", on a
+    // machine that was busy. Both were true - the session was creatable and no session existed
+    // - because an administrator sitting in Settings never expands the dashboard panel, so
+    // monitoring never began at all.
+    //
+    // The cost is bounded and already paid for: the ETW schema is cached per event id, and
+    // aggregation is one hash update per event.
+    if (m_appMonitor)
+        m_appMonitor->startAsync();
+
     // Per-application schedule windows open and close on wall-clock time, so the
     // active set is recomputed periodically. The interval is coarse on purpose: a
     // window boundary is a minute-resolution event, and this must cost nothing
@@ -2136,6 +2154,28 @@ void MainWindow::loadFromStore()
     }
     refreshStartupNote();
 
+    // Self-heal the startup registration, once per launch.
+    //
+    // Up to 1.0.0 the scheduled task could not be created at all: schtasks /TR re-split the
+    // quoted executable path on the space in "Program Files", so every create failed and
+    // only the Run key - which cannot elevate - was ever written. The setting looked "on"
+    // while Windows started an unelevated copy or nothing at all.
+    //
+    // The definition is fixed in autostart.cpp; this repairs an installation that already
+    // carries the broken state, rather than requiring the user to find the toggle and cycle
+    // it. Flowbit is elevated at this point, which is exactly when the task can be created.
+    // Deferred so the window paints before schtasks is spawned.
+    if (settings.startWithWindows && autostart::activeMechanism() != QLatin1String("task")) {
+        QTimer::singleShot(0, this, [this] {
+            const Settings current = m_store->load();
+            if (!current.startWithWindows)
+                return;
+            QString startupError;
+            autostart::setEnabled(true, &startupError);
+            refreshStartupNote();
+        });
+    }
+
     rebuildScheduleCards();
     setLimiterInputsEnabled(settings.enabled);
 
@@ -2177,24 +2217,27 @@ int MainWindow::minutesUntilStartFrom(const Rule &rule, const QDateTime &now)
     if (!start.isValid())
         return -1;
 
+    // Asked first, and outside the day loop, because "am I inside it now" is not a question
+    // about today's mask: the after-midnight tail of an overnight window belongs to the day
+    // it started. Deriving it from today's mask made a Monday-only 22:00 -> 07:00 rule report
+    // "starts in 6 days" at 02:00 on Tuesday while it was, in fact, active.
+    if (ruleMatches(rule, now)) {
+        const QTime end = parseClock(rule.to);
+        QDateTime endsAt(now.date(), end);
+        // Not yet reached today, so the window ends tomorrow.
+        if (end <= now.time())
+            endsAt = endsAt.addDays(1);
+        return -int(now.secsTo(endsAt) / 60);
+    }
+
     for (int dayOffset = 0; dayOffset <= 7; ++dayOffset) {
         const QDateTime day = now.addDays(dayOffset);
         if (!maskContainsDay(rule.days, day.date().dayOfWeek()))
             continue;
 
         const QDateTime candidate(day.date(), start);
-        if (candidate <= now) {
-            if (dayOffset == 0 && ruleMatches(rule, now)) {
-                // Already inside the window; report the negative offset so the
-                // caller can say "ends at" instead of "starts in".
-                const QTime end = parseClock(rule.to);
-                QDateTime endsAt(day.date(), end);
-                if (end <= start)
-                    endsAt = endsAt.addDays(1);
-                return -int(now.secsTo(endsAt) / 60);
-            }
+        if (candidate <= now)
             continue;
-        }
         return int(now.secsTo(candidate) / 60);
     }
     return -1;
@@ -3874,12 +3917,23 @@ void MainWindow::showEvent(QShowEvent *event)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    const Settings settings = m_store->load();
+    const bool quitting = !settings.closeToTray || m_quittingForUninstall;
+
+    // Take the window off the screen BEFORE the blocking work below.
+    //
+    // Quitting tears down two sessions synchronously: ThrottleEngine::detach() joins the packet
+    // workers, and AppMonitor::stop() waits for the ETW consumer to return. Together that is
+    // around a second with the UI thread blocked, and doing it while the window is still visible
+    // is exactly the "press X and it sits there frozen" report. Hiding first means the window is
+    // simply gone instead of frozen.
+    if (quitting)
+        hide();
+
     // Bank usage on the way out. Even when the app keeps running in the tray, the user may
     // well shut the machine down next, and the periodic checkpoint could be up to 30
     // seconds stale.
     m_usage->flush();
-
-    const Settings settings = m_store->load();
 
     // An uninstall closes the window whatever the tray setting says.
     //
@@ -3888,7 +3942,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Flowbit while Flowbit is running, and hiding to the tray would leave it waiting until the
     // user found the tray icon and quit by hand - with nothing on screen to say why the
     // uninstall had stopped.
-    if (!settings.closeToTray || m_quittingForUninstall) {
+    if (quitting) {
         // Close means close.
         //
         // Releasing the engine first is the important part: it stops the worker threads and
@@ -3929,10 +3983,17 @@ void MainWindow::closeEvent(QCloseEvent *event)
         }
     }
 
-    // Release the ETW session and its thread. The window hides rather than exits, so
-    // monitoring is stopped here and restarted when the panel is reopened.
-    if (m_appMonitor)
-        m_appMonitor->stop();
+    // The window hides rather than exits, and monitoring deliberately KEEPS RUNNING.
+    //
+    // It used to be stopped here and "restarted when the panel is reopened". That contradicted
+    // the rest of the design twice over: per-application usage is recorded from the monitor's
+    // snapshot, so stopping it on every close meant usage stopped accumulating for as long as
+    // the window stayed in the tray - which is most of the time.
+    //
+    // It was also the lag on close. AppMonitor::stop() is synchronous and waits for the ETW
+    // consumer to return, so pressing X blocked the UI thread for up to a second before the
+    // window settled. Nothing needs tearing down here: the monitor is meant to live as long as
+    // the application does.
 }
 
 } // namespace net

@@ -71,6 +71,7 @@ SOURCES += \
     src/navbutton.cpp \
     src/sidebar.cpp \
     src/appmonitor.cpp \
+    src/etwclass.cpp \
     src/applimitengine.cpp \
     src/applimiterpage.cpp \
     src/appruledialog.cpp \
@@ -125,6 +126,7 @@ HEADERS += \
     src/navbutton.h \
     src/sidebar.h \
     src/appmonitor.h \
+    src/etwclass.h \
     src/applimitengine.h \
     src/applimiterpage.h \
     src/appruledialog.h \

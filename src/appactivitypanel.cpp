@@ -287,15 +287,9 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
             setMinimumHeight(0);
             setMaximumHeight(QWIDGETSIZE_MAX);
 
-            // The collapse has finished, so nothing is animating any more: the
-            // safe moment to tear the trace session down.
-            if (m_stopMonitorWhenCollapsed && m_monitor) {
-                m_stopMonitorWhenCollapsed = false;
-                QTimer::singleShot(0, this, [this] {
-                    if (m_monitor && !m_expanded && m_monitor->isRunning())
-                        m_monitor->stop();
-                });
-            }
+            // The trace session is deliberately NOT torn down here any more. See the collapse
+            // branch of setExpanded(): the monitor now runs for as long as the application does,
+            // so there is nothing to release when the panel closes.
         } else {
             // Fully expanded: KEEP the height pin at the tween's end value.
             //
@@ -408,31 +402,21 @@ void AppActivityPanel::setExpanded(bool expanded)
             setAnimHeight(-1);
         }
     } else {
-        // Collapsing. Brief #10: release the session when it is not needed, so a
-        // collapsed dashboard holds no ETW handles.
+        // Collapsing. The trace session is deliberately KEPT.
         //
-        // The stop is DEFERRED until the collapse animation has finished, and this
-        // is a crash fix, not tidiness. AppMonitor::stop() is synchronous and
-        // blocks on the UI thread for up to about a second while the trace session
-        // tears down. Calling it here meant that, for the whole 280 ms of the
-        // collapse, a blocking teardown was running against the same widgets the
-        // animation was still touching - and the panel hides itself at the end of
-        // that animation. Show Less crashed the app as a result.
+        // It used to be torn down here so a collapsed dashboard held no ETW handles. But the
+        // per-application usage table is filled from the monitor's snapshot, so stopping it
+        // meant usage was recorded only while the panel happened to be open - low by design.
         //
-        // Deferring keeps the two apart: the animation completes (or is
-        // interrupted), and only then does the session go away. A pending stop is
-        // recorded so a rapid expand-collapse-expand cannot leave the session
-        // orphaned.
-        if (m_monitor && m_monitor->isRunning()) {
-            if (m_animated && m_expandAnim
-                && m_expandAnim->state() == QAbstractAnimation::Running) {
-                m_stopMonitorWhenCollapsed = true;
-            } else {
-                // No animation in flight: safe to stop immediately.
-                m_monitor->stop();
-                m_stopMonitorWhenCollapsed = false;
-            }
-        }
+        // It is also why Diagnostics could read "ETW events received: 0 (decoded: 0)" on a
+        // busy machine: an administrator sitting in Settings never expands this panel, so the
+        // session never existed. Both readings were true and neither made sense alone.
+        //
+        // The monitor now runs for as long as the application does (MainWindow starts it). The
+        // deferred-stop machinery went with it: it existed only because AppMonitor::stop() is
+        // synchronous and blocked the UI thread for up to a second mid-collapse, which crashed
+        // the app, so it had to be deferred to the end of the animation.
+        m_stopMonitorWhenCollapsed = false;
 
         if (m_animated) {
             // Collapse: shrink from the current height back to nothing. Starting

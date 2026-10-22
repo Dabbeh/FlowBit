@@ -11,12 +11,15 @@
 // are compared.
 
 #include "updater.h"
+#include "project_paths.h"
 
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
 #include <QTimer>
+#include <QUrl>
 
 #include <cstdio>
 
@@ -93,7 +96,7 @@ int main(int argc, char *argv[])
     // ---- 1. the committed file parses ------------------------------------
     // Read from disk first, so the parsing is checked without depending on the network.
     {
-        QFile f(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/docs/version.json"));
+        QFile f(project::file(QStringLiteral("docs/version.json")));
         check(f.exists(), "docs/version.json exists in the repository");
         if (f.open(QIODevice::ReadOnly)) {
             const QByteArray body = f.readAll();
@@ -137,8 +140,9 @@ int main(int argc, char *argv[])
     // so a higher version can be presented without publishing anything.
     {
         std::printf("\n== a newer version ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/newer.json");
+        // Beside the test executable rather than in a hard-coded build directory, and turned
+        // into a URL by QUrl so the path separators and any spaces are encoded properly.
+        const QString path = project::scratch(QStringLiteral("update-newer.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"9.9.9\",\n"
@@ -147,7 +151,7 @@ int main(int argc, char *argv[])
             f.close();
         }
 
-        Updater::setVersionFileUrl(QStringLiteral("file:///") + path);
+        Updater::setVersionFileUrl(QUrl::fromLocalFile(path).toString());
         Updater u(nullptr);
         const Outcome o = runCheck(&u, 15000);
 
@@ -162,15 +166,14 @@ int main(int argc, char *argv[])
     // ---- 4. an OLDER version is not offered -------------------------------
     {
         std::printf("\n== an older version ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/older.json");
+        const QString path = project::scratch(QStringLiteral("update-older.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"0.1.0\",\n  \"url\": \"https://example.invalid/x\"\n}\n");
             f.close();
         }
 
-        Updater::setVersionFileUrl(QStringLiteral("file:///") + path);
+        Updater::setVersionFileUrl(QUrl::fromLocalFile(path).toString());
         Updater u(nullptr);
         const Outcome o = runCheck(&u, 15000);
         std::printf("  outcome: %s\n", qPrintable(o.kind));
@@ -181,15 +184,14 @@ int main(int argc, char *argv[])
     // ---- 5. a malformed file is reported, not ignored --------------------
     {
         std::printf("\n== a malformed file ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/broken.json");
+        const QString path = project::scratch(QStringLiteral("update-broken.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{ this is not json");
             f.close();
         }
 
-        Updater::setVersionFileUrl(QStringLiteral("file:///") + path);
+        Updater::setVersionFileUrl(QUrl::fromLocalFile(path).toString());
         Updater u(nullptr);
         const Outcome o = runCheck(&u, 15000);
         std::printf("  outcome: %s - %s\n", qPrintable(o.kind), qPrintable(o.reason));
@@ -200,15 +202,14 @@ int main(int argc, char *argv[])
     // ---- 6. a file missing its fields is refused -------------------------
     {
         std::printf("\n== a file with no download address ==\n");
-        const QString path =
-            QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/build/tests/nourl.json");
+        const QString path = project::scratch(QStringLiteral("update-nourl.json"));
         QFile f(path);
         if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
             f.write("{\n  \"version\": \"2.0.0\"\n}\n");
             f.close();
         }
 
-        Updater::setVersionFileUrl(QStringLiteral("file:///") + path);
+        Updater::setVersionFileUrl(QUrl::fromLocalFile(path).toString());
         Updater u(nullptr);
         const Outcome o = runCheck(&u, 15000);
         std::printf("  outcome: %s - %s\n", qPrintable(o.kind), qPrintable(o.reason));

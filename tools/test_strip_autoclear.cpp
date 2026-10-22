@@ -20,6 +20,7 @@
 #include "usagetracker.h"
 #include "sidebar.h"
 #include "theme.h"
+#include "project_paths.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
@@ -73,9 +74,14 @@ int main(int argc, char *argv[])
     // The exact fault that recurred. If any code path bypasses showErrorStrip() it can omit the
     // timer, and nothing would report it - which is how the second occurrence happened.
     {
-        QFile f(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/src/mainwindow.cpp"));
-        if (f.open(QIODevice::ReadOnly)) {
-            const QString body = QString::fromUtf8(f.readAll());
+        // The source is located from the project tree rather than an absolute path, and a
+        // miss is a FAILURE. It used to print "structural check skipped" and carry on, so a
+        // wrong path made this test pass while checking nothing - which is how the same fault
+        // went unnoticed a second time.
+        const QString body = project::read(QStringLiteral("src/mainwindow.cpp"));
+        check(!body.isEmpty(), "the main window source is readable for the structural check");
+
+        if (!body.isEmpty()) {
             const int handWritten = body.count(QStringLiteral("m_errorLabel->show();"));
             const int routed = body.count(QStringLiteral("showErrorStrip();"));
 
@@ -86,8 +92,6 @@ int main(int argc, char *argv[])
                   QStringLiteral("no call site shows the strip by hand (%1 found)").arg(handWritten));
             check(routed >= 5,
                   QStringLiteral("and the known call sites are routed (%1)").arg(routed));
-        } else {
-            std::printf("  (source not readable, structural check skipped)\n");
         }
     }
 

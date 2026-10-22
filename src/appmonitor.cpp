@@ -1,5 +1,9 @@
 #include "appmonitor.h"
 
+#include <algorithm>
+#include <QStringList>
+#include "etwclass.h"
+
 #include "appnames.h"
 
 #include <QCoreApplication>
@@ -12,7 +16,9 @@
 #include <QTimer>
 
 #include <winsock2.h>
+#include <ws2ipdef.h>   // netioapi's MIB_IF_* definitions are gated on _WS2IPDEF_
 #include <iphlpapi.h>
+#include <netioapi.h>   // GetIfTable2/MIB_IF_ROW2; iphlpapi only pulls this in for NTDDI >= Vista
 #include <windows.h>
 #include <evntrace.h>
 #include <evntcons.h>
@@ -73,12 +79,41 @@ constexpr GUID kKernelNetworkProvider = {
 //      other way round.
 constexpr USHORT kTcpSend = 10;         // upload
 constexpr USHORT kTcpRecv = 11;         // download
-constexpr USHORT kTcpRetransmit = 14;   // a retransmission of sent data
+constexpr USHORT kTcpRetransmit = 14;
+
+// Event schema blobs, keyed by event id and version.
+//
+// Shared ownership because a blob is handed out under the lock and used after it: the entry may
+// be evicted while a decoding pass is still reading it.
+QHash<quint32, std::shared_ptr<std::vector<BYTE>>> schemaCache;
+QMutex schemaMutex;   // a retransmission of sent data
 constexpr USHORT kTcpIpv6Send = 26;     // upload, IPv6
 constexpr USHORT kTcpIpv6Recv = 27;     // download, IPv6
 constexpr USHORT kTcpIpv6Retransmit = 30;
 
 const wchar_t *kSessionName = L"Flowbit-AppMonitor";
+
+// Total bytes moved by every non-loopback interface.
+//
+// ETW silence only means the source is broken when the machine was actually
+// transferring. Without this witness, an idle minute at startup promoted the TCP
+// fallback and the panel lost UDP/QUIC for the rest of the session.
+quint64 systemByteCount()
+{
+    MIB_IF_TABLE2 *table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || !table)
+        return 0;
+
+    quint64 total = 0;
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IF_ROW2 &row = table->Table[i];
+        if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK)
+            continue;
+        total += row.InOctets + row.OutOctets;
+    }
+    FreeMibTable(table);
+    return total;
+}
 
 // One network operation, as read out of the event payload.
 struct NetEvent {
@@ -107,6 +142,69 @@ struct EventPayload {
 
 // Directs the ETW callback back to the owning monitor instance.
 AppMonitor::Impl *g_activeConsumer = nullptr;
+
+// True when `pid` is another running Flowbit. Used to leave a live instance's
+// trace session alone while reclaiming sessions left by killed runs.
+bool isLiveFlowbit(quint32 pid)
+{
+    if (pid == GetCurrentProcessId())
+        return true;
+
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return false;
+
+    wchar_t path[1024] = {};
+    DWORD size = DWORD(sizeof(path) / sizeof(path[0]));
+    const bool ok = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE;
+    CloseHandle(process);
+    if (!ok)
+        return false;
+
+    const QString image = QString::fromWCharArray(path, int(size));
+    return image.endsWith(QStringLiteral("Flowbit.exe"), Qt::CaseInsensitive);
+}
+
+QStringList flowbitSessionNames()
+{
+    // logman is already the bounded, out-of-process way this file stops a
+    // session; use it to enumerate too, rather than duplicating QueryAllTraces'
+    // buffer sizing in another place.
+    QProcess lm;
+    lm.start(QStringLiteral("logman.exe"),
+             {QStringLiteral("query"), QStringLiteral("-ets")});
+    if (!lm.waitForStarted(2000) || !lm.waitForFinished(5000))
+        return {};
+
+    const QString out = QString::fromLocal8Bit(lm.readAllStandardOutput());
+    QStringList names;
+    for (const QString &line : out.split(QLatin1Char('\n'))) {
+        const QString name = line.trimmed().section(QLatin1Char(' '), 0, 0);
+        if (name == QLatin1String("Flowbit-AppMonitor")
+            || name.startsWith(QLatin1String("Flowbit-AppMonitor-")))
+            names.append(name);
+    }
+    names.removeDuplicates();
+    return names;
+}
+
+bool stopSessionByName(const QString &name)
+{
+    // Out of process and bounded on purpose: ControlTrace(STOP) can block
+    // indefinitely on a real-time session whose owner was killed mid-flight.
+    // logman does the same job without ever wedging the caller.
+    QProcess lm;
+    lm.start(QStringLiteral("logman.exe"),
+             {QStringLiteral("stop"), name, QStringLiteral("-ets")});
+    if (!lm.waitForStarted(1500))
+        return false;
+    if (!lm.waitForFinished(4000)) {
+        lm.kill();
+        lm.waitForFinished(1000);
+        return false;
+    }
+    return lm.exitStatus() == QProcess::NormalExit && lm.exitCode() == 0;
+}
 
 } // namespace
 
@@ -159,14 +257,46 @@ public:
     // shared one was held by an orphaned session. Surfaced in diagnostics.
     bool usedFallbackName = false;
     TRACEHANDLE traceHandle = INVALID_PROCESSTRACE_HANDLE;
+    // Must outlive ProcessTrace: OpenTrace receives the address of this structure, which
+    // holds the callback and session name. A stack local here was the other reason the
+    // consumer could sit at zero while the session was visibly running.
+    EVENT_TRACE_LOGFILEW logfile{};
     bool sessionOwned = false;
     QThread *thread = nullptr;
     std::atomic<bool> stopping{false};
+
+    // Result of ProcessTrace() and whether the consumer thread has returned.
+    //
+    // ProcessTrace's return value was DISCARDED, so a consumer that failed immediately left the
+    // session "active" while nothing was ever read from it: Diagnostics showed
+    // "active (this session)", 40s of monitoring, 0 events, and the app had no idea. Capturing the
+    // code is what turns that into something reportable - and recoverable.
+    std::atomic<quint32> consumerExitCode{0};
+    std::atomic<bool> consumerExited{false};
+    std::atomic<int> consumerRestarts{0};
+
+    // How the provider enable went, and whether the one-shot re-enable fired.
+    //
+    // A session can accept an enable and still deliver nothing; recording the code and the attempt
+    // count is what separates "never enabled" from "enabled and silent" in the report.
+    std::atomic<quint32> providerEnableRc{0};
+    std::atomic<int> providerEnableAttempts{0};
+    std::atomic<bool> reenableTried{false};
 
     // Counts events so the UI can tell "session running, no traffic" apart from
     // "session running but delivering nothing".
     std::atomic<quint64> eventsSeen{0};
     std::atomic<quint64> eventsParsed{0};
+    std::atomic<quint64> udpEvents{0};   // UDP events seen, for diagnostics
+
+    // Every event id the provider delivers, counted BEFORE classification.
+    //
+    // This exists because "UDP is not counted" has now been diagnosed twice by reasoning and been
+    // wrong both times. Ids 0..127 cover this provider with room to spare; anything above is
+    // counted in idOverflow. The report shows which ids actually arrive, so the next question
+    // ("are 42/43 in the stream at all?") is answered by data.
+    std::atomic<quint64> idCounts[128] = {};
+    std::atomic<quint64> idOverflow{0};
 
     // Per-event-id decode accounting plus the payload schema of the first event
     // seen for that id. Written by the ETW callback, read by diagnostics: this is
@@ -203,7 +333,17 @@ public:
     // scope note, NOT as an error, because nothing is broken.
     QString etwBlockedReason;
     int silentTicks = 0;
+    quint64 lastSystemBytes = 0;   // baseline for systemByteCount(), see tick()
     quint64 lastSeenSample = 0;
+
+    // Whether ETW has delivered at least one real event in this session.
+    //
+    // Once it has, silence can only mean "no traffic", never "the source is broken".
+    // Without this latch an idle machine - every application reading 0 B/s - produced three
+    // silent ticks and the monitor declared ETW dead, switched to the TCP fallback and
+    // showed a warning under the table. The warning then disappeared as soon as traffic
+    // arrived, so the panel appeared to flap between sources while ETW was working fine.
+    bool etwProven = false;
 
     struct ConnKey {
         quint32 localAddr;
@@ -350,6 +490,12 @@ public:
     ~Impl() { stopSession(); }
 
     void stopSession();
+    void stopStaleSessions();
+    ULONG enableProvider();
+
+    // Seconds this session has been up. Used to decide when "no events yet" stops being normal.
+    int tickCount = 0;
+    int consumerSeconds() const { return tickCount; }
     bool startSession(QString *why);
 
     // Aggregation.
@@ -362,15 +508,34 @@ public:
     void sweepDeadPids();
 };
 
+ULONG AppMonitor::Impl::enableProvider()
+{
+    const ULONG rc = EnableTraceEx2(session, &kKernelNetworkProvider,
+                                    EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                                    TRACE_LEVEL_VERBOSE,
+                                    0xFFFFFFFFFFFFFFFFULL,   // any keyword
+                                    0, 0, nullptr);
+    providerEnableRc.store(rc);
+    providerEnableAttempts.fetch_add(1);
+    return rc;
+}
+
 void AppMonitor::Impl::stopSession()
 {
     stopping.store(true);
 
-    if (traceHandle != INVALID_PROCESSTRACE_HANDLE) {
-        CloseTrace(traceHandle);
-        traceHandle = INVALID_PROCESSTRACE_HANDLE;
-    }
-
+    // THE ORDER HERE IS THE WHOLE POINT, and it used to be wrong.
+    //
+    // ProcessTrace() is a blocking call running on the consumer thread, and it holds the trace
+    // handle for as long as it runs. CloseTrace() frees that handle's control block. The old code
+    // closed the handle FIRST and joined the thread afterwards, which meant the consumer was still
+    // inside ProcessTrace while the handle it was using had already been freed - a use-after-close
+    // against the ETW runtime, and exactly the shape of an intermittent crash on collapse.
+    //
+    // The documented order is the reverse:
+    //   1. stop the session   - this is what makes ProcessTrace return
+    //   2. wait for the consumer thread, so ProcessTrace has actually returned
+    //   3. close the trace handle, now that nothing is using it
     if (sessionOwned && session != 0) {
         // StopTrace blocks until the consumer has drained.
         StopTraceW(session, sessionNameInUse(), nullptr);
@@ -383,10 +548,26 @@ void AppMonitor::Impl::stopSession()
 
     if (thread) {
         thread->quit();
-        thread->wait(3000);
-        delete thread;
-        thread = nullptr;
+        if (thread->wait(5000)) {
+            delete thread;
+            thread = nullptr;
+        } else {
+            // Still inside ProcessTrace. Deleting a running QThread destroys the thread object
+            // under a live stack frame, so the object is deliberately left in place: the thread
+            // exits when the session stop is observed, and the handle below is NOT closed while it
+            // may still be in use. A leaked QThread object is the lesser fault by a wide margin.
+            qWarning("Flowbit: the ETW consumer thread did not stop within 5s; leaving its handle "
+                     "open rather than closing it under a running ProcessTrace");
+            stopping.store(false);
+            return;
+        }
     }
+
+    if (traceHandle != INVALID_PROCESSTRACE_HANDLE) {
+        CloseTrace(traceHandle);
+        traceHandle = INVALID_PROCESSTRACE_HANDLE;
+    }
+
     stopping.store(false);
 }
 
@@ -425,6 +606,24 @@ QPair<quint16, quint16> readEphemeralRange()
     return cached;
 }
 
+// Offset of the event's own name inside TRACE_EVENT_INFO.
+//
+// The Windows SDK declares this as `union { ULONG EventNameOffset; ULONG ActivityIDNameOffset; }` -
+// for a manifest-based event the union holds the event name. MinGW's tdh.h predates that rename and
+// only exposes the older member, at the same offset. Rather than pinning the project to one SDK,
+// the member is probed at compile time: the first overload is chosen when the name exists.
+template <typename Info>
+static auto eventNameOffset(const Info *info, int) -> decltype(info->EventNameOffset)
+{
+    return info->EventNameOffset;
+}
+
+template <typename Info>
+static ULONG eventNameOffset(const Info *info, long)
+{
+    return info->ActivityIDNameOffset;
+}
+
 // EVENT_RECORD callback. Runs on the monitor thread.
 //
 // Reads the payload fields by name through TDH. A field that cannot be resolved
@@ -442,14 +641,6 @@ void WINAPI eventCallback(PEVENT_RECORD record)
     // ratio looked like a decoder failure (measured: 3 164 of 9 270, "34%") when
     // most of the remainder were events deliberately not counted.
     const USHORT id = record->EventHeader.EventDescriptor.Id;
-    const bool isV6 = (id == kTcpIpv6Send || id == kTcpIpv6Recv
-                       || id == kTcpIpv6Retransmit);
-    const bool isTransfer = (id == kTcpSend || id == kTcpRecv
-                             || id == kTcpRetransmit || isV6);
-    if (!isTransfer)
-        return;
-
-    impl->eventsSeen.fetch_add(1);
 
     // NOTE: the owning process comes from the payload's PID property (read
     // below), NOT from EventHeader.ProcessId. Using the header was part of the
@@ -457,13 +648,81 @@ void WINAPI eventCallback(PEVENT_RECORD record)
 
     // Resolve the payload properties through TDH. Match by NAME - the byte
     // layout differs across Windows builds, but the field names are stable.
-    ULONG bufferSize = 0;
-    if (TdhGetEventInformation(record, 0, nullptr, nullptr, &bufferSize) != ERROR_INSUFFICIENT_BUFFER)
-        return;
+    //
+    // The schema is fetched ONCE per event id and version and then reused.
+    //
+    // TdhGetEventInformation is not a cheap accessor: it resolves the provider's manifest and
+    // builds the property table, and it was being called twice for every single event - once to
+    // measure the buffer and once to fill it. While traffic was busy that dominated the process's
+    // CPU time, which is what made Flowbit cost measurable battery while sitting in the tray with
+    // the window closed. The blob is immutable for a given id and version, so caching it removes
+    // the work entirely after the first event of each kind.
+    const quint32 schemaKey = (quint32(id) << 16)
+                              | quint32(record->EventHeader.EventDescriptor.Version);
 
-    std::vector<BYTE> infoBuf(bufferSize);
-    auto *info = reinterpret_cast<PTRACE_EVENT_INFO>(infoBuf.data());
-    if (TdhGetEventInformation(record, 0, nullptr, info, &bufferSize) != ERROR_SUCCESS)
+    std::shared_ptr<std::vector<BYTE>> schema;
+    {
+        QMutexLocker lock(&schemaMutex);
+        const auto it = schemaCache.constFind(schemaKey);
+        if (it != schemaCache.constEnd())
+            schema = *it;
+    }
+
+    if (!schema) {
+        ULONG bufferSize = 0;
+        if (TdhGetEventInformation(record, 0, nullptr, nullptr, &bufferSize)
+            != ERROR_INSUFFICIENT_BUFFER)
+            return;
+
+        auto fresh = std::make_shared<std::vector<BYTE>>(bufferSize);
+        auto *freshInfo = reinterpret_cast<PTRACE_EVENT_INFO>(fresh->data());
+        if (TdhGetEventInformation(record, 0, nullptr, freshInfo, &bufferSize) != ERROR_SUCCESS)
+            return;
+
+        QMutexLocker lock(&schemaMutex);
+        // Bounded: a provider with many ids must not grow this without limit. Sixteen kinds cover
+        // this provider's TCP events several times over.
+        if (schemaCache.size() >= 16)
+            schemaCache.clear();
+        schemaCache.insert(schemaKey, fresh);
+        schema = fresh;
+    }
+
+    auto *info = reinterpret_cast<PTRACE_EVENT_INFO>(schema->data());
+
+    // Classify by the event's OWN NAME, with the id table as a fallback - see etwclass.h for why.
+    //
+    // This is what makes UDP visible. The decoder previously recognised only TCP send/receive by
+    // hardcoded ids, so DNS, QUIC, WireGuard, game and video-call traffic were invisible even
+    // though the provider reports all of it and Resource Monitor shows it. Names also cover the
+    // IPv4 and IPv6 variants without a table to keep in step.
+    const wchar_t *eventName = nullptr;
+    const ULONG nameOffset = eventNameOffset(info, 0);
+    if (nameOffset) {
+        eventName = reinterpret_cast<const wchar_t *>(
+            reinterpret_cast<const BYTE *>(info) + nameOffset);
+    }
+
+    if (id < 128)
+        impl->idCounts[id].fetch_add(1);
+    else
+        impl->idOverflow.fetch_add(1);
+
+    const etwclass::Kind kind = etwclass::classify(eventName, id);
+    if (!kind.transfer)
+        return;   // connect, disconnect, copy, failure: carries no bytes to count
+
+    impl->eventsSeen.fetch_add(1);
+    impl->etwProven = true;   // proof, from now on, that this source works
+    if (kind.udp)
+        impl->udpEvents.fetch_add(1);
+
+    // Retransmissions carry the size of data that was already counted when it was first sent.
+    // Adding them again inflates per-application usage above the traffic that actually moved - and
+    // it disagrees with the TCP-counter source, whose DataBytes numbers count sequence space rather
+    // than wire repeats, so the same application would read differently depending on which source
+    // was active. They still prove the source is alive, which is why the latch above runs first.
+    if (kind.retransmit)
         return;
 
     // ---------------------------------------------------------------------
@@ -622,8 +881,7 @@ void WINAPI eventCallback(PEVENT_RECORD record)
     // The 3-tuple below is the whole rule; the port and address heuristics that
     // used to live here are deleted rather than kept as fallbacks, because they
     // could only ever produce a wrong answer once the id decides correctly.
-    const bool send = (id == kTcpSend || id == kTcpRetransmit
-                       || id == kTcpIpv6Send || id == kTcpIpv6Retransmit);
+    const bool send = kind.send;
 
     // Record the raw evidence for this event. Cheap, bounded, and it is what made
     // the rule above provable - keep it until the direction is confirmed live.
@@ -788,6 +1046,20 @@ void AppMonitor::Impl::noteAddressMiss(quint32 saddr, quint32 daddr, bool sLocal
 void AppMonitor::Impl::ingest(const NetEvent &event)
 {
     QMutexLocker lock(&mutex);
+
+    // Exactly one source may feed the counters.
+    //
+    // Both ETW and the TCP-counter fallback add into inBytes/outBytes, and nothing stopped them
+    // from doing so during the same window: while the fallback was the chosen source the ETW
+    // session was still alive and still delivering events for the same connections, so the same
+    // traffic was counted twice. The result was per-application usage that read higher than the
+    // traffic that actually moved - reported as the numbers "not exactly accurate".
+    //
+    // The guard sits here, at the accumulation point, rather than at the call sites: a future
+    // caller cannot reintroduce the overlap by forgetting to check the flag.
+    if (useEstats)
+        return;
+
     if (event.send)
         outBytes[event.pid] += event.size;
     else
@@ -860,6 +1132,7 @@ void AppMonitor::Impl::collectEstats()
         plain.dwRemotePort = r.dwRemotePort;
 
         ConnCounters &c = connLast[key];
+        const bool firstRead = !c.enabled;
 
         // Enable collection once per connection (idempotent). Without it the ROD
         // reads return garbage - documented in the feasibility scan.
@@ -873,7 +1146,6 @@ void AppMonitor::Impl::collectEstats()
                 connLast.remove(key);
                 continue;
             }
-            c.enabled = true;
         }
 
         TCP_ESTATS_DATA_ROD_v0 rod{};
@@ -882,6 +1154,17 @@ void AppMonitor::Impl::collectEstats()
                                       reinterpret_cast<PUCHAR>(&rod), 0, sizeof(rod))
             != NO_ERROR)
             continue;
+
+        // The first successful read after enabling reports the connection's lifetime
+        // bytes, which are not new traffic. Seed the baseline and book nothing. Keep
+        // enabled false until that read succeeds, or a failed first read would make
+        // the next one book the whole lifetime.
+        if (firstRead) {
+            c.in = rod.DataBytesIn;
+            c.out = rod.DataBytesOut;
+            c.enabled = true;
+            continue;
+        }
 
         const quint64 dIn = (rod.DataBytesIn >= c.in) ? rod.DataBytesIn - c.in : 0;
         const quint64 dOut = (rod.DataBytesOut >= c.out) ? rod.DataBytesOut - c.out : 0;
@@ -910,6 +1193,13 @@ void AppMonitor::Impl::applyEstatsDeltas(const QHash<quint32, quint64> &inDelta,
                                          const QHash<quint32, quint64> &outDelta)
 {
     QMutexLocker lock(&mutex);
+
+    // The other half of the same rule: the fallback contributes only while it is the chosen
+    // source. See ingest() for why the pair must be mutually exclusive rather than merely
+    // usually so.
+    if (!useEstats)
+        return;
+
     for (auto it = inDelta.constBegin(); it != inDelta.constEnd(); ++it)
         inBytes[it.key()] += it.value();
     for (auto it = outDelta.constBegin(); it != outDelta.constEnd(); ++it)
@@ -1024,6 +1314,36 @@ void AppMonitor::Impl::completeInterval(double seconds, double quietSeconds)
     Q_UNUSED(quietSeconds)
 }
 
+void AppMonitor::Impl::stopStaleSessions()
+{
+    int stopped = 0;
+    const QStringList names = flowbitSessionNames();
+    for (const QString &name : names) {
+        // The pre-PID name is never used by this version; any session under it
+        // belongs to an older run.
+        if (name == QLatin1String("Flowbit-AppMonitor")) {
+            if (stopSessionByName(name))
+                ++stopped;
+            continue;
+        }
+
+        // Flowbit-AppMonitor-<pid>[-<nonce>]
+        const QStringList parts = name.split(QLatin1Char('-'));
+        if (parts.size() < 3)
+            continue;
+        bool ok = false;
+        const quint32 pid = parts.at(2).toUInt(&ok);
+        if (!ok || isLiveFlowbit(pid))
+            continue;   // another running instance still owns it
+
+        if (stopSessionByName(name))
+            ++stopped;
+    }
+
+    if (stopped > 0)
+        qInfo("Flowbit: reclaimed %d stale ETW session(s) before starting", stopped);
+}
+
 bool AppMonitor::Impl::startSession(QString *why)
 {
     // Try to start the session.
@@ -1048,11 +1368,15 @@ bool AppMonitor::Impl::startSession(QString *why)
         props->Wnode.BufferSize = bufferSize;
         props->Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         props->Wnode.ClientContext = 1;   // QPC timestamps
-        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE;
+        props->LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+                             | EVENT_TRACE_INDEPENDENT_SESSION_MODE;
         props->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
-        props->BufferSize = 64;           // KB, small: only counters are wanted
-        props->MinimumBuffers = 4;
-        props->MaximumBuffers = 16;
+        // Kernel-Network emits one event per packet, so 64 KB buffers overflow within a
+        // fraction of a second and the real-time consumer receives nothing at all. Give the
+        // logger room to breathe: 16 x 1 MB start, up to 64 MB under load.
+        props->BufferSize = 1024;         // KB
+        props->MinimumBuffers = 16;
+        props->MaximumBuffers = 64;
         props->FlushTimer = 1;
 
         auto *nameField = reinterpret_cast<wchar_t *>(propsBuf.data() + props->LoggerNameOffset);
@@ -1063,6 +1387,12 @@ bool AppMonitor::Impl::startSession(QString *why)
             activeSessionName = name;
         return rc;
     };
+
+    // Reclaim sessions left by killed runs before creating ours. Independent
+    // sessions outlive their process, so a force-kill, crash or installer
+    // replacing Flowbit can leave one behind; enough of them starve new
+    // sessions of events and silently force the TCP-only fallback.
+    stopStaleSessions();
 
     // Start on a name that is unique by construction: the shared legacy name is
     // what dead runs leave behind, and a collision with it on this build returns
@@ -1154,12 +1484,11 @@ bool AppMonitor::Impl::startSession(QString *why)
             if (startRc == ERROR_ACCESS_DENIED) {
                 *why = QStringLiteral(
                     "Flowbit could not start per-application monitoring: access was "
-                    "denied. On this Windows build that almost always means a "
-                    "monitoring session left behind by an earlier run that was "
-                    "closed or crashed while monitoring was active. Run "
-                    "Fix-Monitoring.bat in the Flowbit folder (accept the admin "
-                    "prompt), then press Retry. A restart of the PC also clears "
-                    "any stale session.");
+                    "denied. A leftover monitoring session from an earlier run can cause "
+                    "this, and so can game anti-cheat or security software that blocks new "
+                    "trace sessions (EA AntiCheat is a known case). Restart the PC, close "
+                    "such software, then press Retry. Until then the figures below are "
+                    "TCP-only: UDP and QUIC are not counted.");
             } else if (startRc == ERROR_ALREADY_EXISTS) {
                 // Still blocked after the bounded attempt. The cleanup's own words
                 // matter here: logman reports "Data Collector Set was not found"
@@ -1190,38 +1519,15 @@ bool AppMonitor::Impl::startSession(QString *why)
     // some builds the kernel-network events are emitted at level 5 and an
     // INFORMATION-level session silently filters them out (observed: session
     // running, counters zero, traffic active).
-    const ULONG enableRc = EnableTraceEx2(session, &kKernelNetworkProvider,
-                                          EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                                          TRACE_LEVEL_VERBOSE,
-                                          0xFFFFFFFFFFFFFFFFULL,   // any keyword
-                                          0, 0, nullptr);
-    if (enableRc != ERROR_SUCCESS) {
-        // Reported to the debug log rather than to the user: the note shown under the table
-        // says what the fallback costs, and the number is in the diagnostics report.
-        qInfo("Flowbit: the kernel network provider would not enable (error %lu), "
-              "falling back to TCP EStats",
-              static_cast<unsigned long>(enableRc));
-        StopTraceW(session, sessionNameInUse(), nullptr);
-        session = 0;
-        sessionOwned = false;
-        if (why)
-            // One short sentence, and no error number.
-            //
-            // The wording has now been wrong in both directions. "Could not be enabled (error
-            // 1450)" described a handled fallback as a failure. Replacing it with four lines of
-            // explanation described it correctly and broke the layout: a note that long sets a
-            // minimum width on the panel, so the columns are pushed off the right edge even in a
-            // full-screen window.
-            //
-            // This is an annotation under a table. It says which source the figures came from
-            // and what that source does not see. The build of Windows, the error number and the
-            // word "unavailable" are all in the diagnostics report, which has room for them.
-            *why = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted on this system.");
-        return false;
-    }
+    // The provider is enabled AFTER the consumer is attached (see below): enabling it first is the
+    // documented trap, because the session's buffers fill with events that no consumer is draining.
+    // The comment that used to live here explains the level and keyword choice, which is unchanged:
+    // MatchAnyKeyword = 0 is the classic 'enable everything' call but was observed delivering zero
+    // events for this provider on the newest builds, and an INFORMATION-level session filters out
+    // the level-5 kernel-network events. Full keyword mask plus verbose level.
 
     // Open the real-time consumer.
-    EVENT_TRACE_LOGFILEW logfile{};
+    logfile = EVENT_TRACE_LOGFILEW{};
     logfile.LoggerName = const_cast<LPWSTR>(sessionNameInUse());
     logfile.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME
                                | PROCESS_TRACE_MODE_EVENT_RECORD;
@@ -1235,8 +1541,15 @@ bool AppMonitor::Impl::startSession(QString *why)
             *why = QStringLiteral(
                 "Another per-application monitoring handle is already active in "
                 "this process.");
+        // The session was created above; leaving it running would strand a session
+        // that this object no longer has a handle to stop.
+        stopSession();
         return false;
     }
+
+    tickCount = 0;
+    consumerExitCode.store(0);
+    consumerExited.store(false);
 
     g_activeConsumer = this;
     traceHandle = OpenTraceW(&logfile);
@@ -1253,10 +1566,46 @@ bool AppMonitor::Impl::startSession(QString *why)
 
     // ProcessTrace blocks, so it runs on the monitor thread.
     thread = QThread::create([this] {
-        PROCESS_TRACE_MODE_EVENT_RECORD;
-        ProcessTrace(&traceHandle, 1, nullptr, nullptr);
+        // The stray PROCESS_TRACE_MODE_EVENT_RECORD statement that used to sit here was a no-op
+        // left over from an edit; the mode is set on the logfile, not here.
+        const ULONG rc = ProcessTrace(&traceHandle, 1, nullptr, nullptr);
+
+        consumerExitCode.store(rc);
+        consumerExited.store(true);
+
+        if (!stopping.load()) {
+            // Returned while the session is still wanted: the consumer is gone and every event the
+            // provider sends from now on is discarded by the ETW runtime. Report it, release the
+            // process-wide consumer slot so a restart is allowed, and let tick() rebuild.
+            qWarning("Flowbit: the ETW consumer stopped unexpectedly (ProcessTrace returned %lu)",
+                     static_cast<unsigned long>(rc));
+            if (g_activeConsumer == this)
+                g_activeConsumer = nullptr;
+        }
     });
     thread->start();
+
+    // THE ORDER HERE IS THE POINT.
+    //
+    // Microsoft's Consuming Events documentation states that ProcessTrace blocks until the session
+    // stops or CloseTrace is called, and that a real-time session has exactly one consumer. It does
+    // not say when to enable the provider - and enabling it BEFORE a consumer exists is the
+    // documented trap: the session accepts the enable, its buffers fill with events nobody drains,
+    // and the consumer that arrives afterwards can sit at zero indefinitely. That is the reported
+    // symptom: session "active (this session)", 40s of monitoring, 0 events, no ids.
+    //
+    // The provider is therefore enabled once ProcessTrace is running. The short wait is on a worker
+    // thread (start() runs in startAsync's thread), so it costs the UI nothing.
+    QThread::msleep(50);
+    const ULONG enableRc = enableProvider();
+    if (enableRc != ERROR_SUCCESS) {
+        qInfo("Flowbit: the kernel network provider would not enable (error %lu), falling back to "
+              "TCP EStats", static_cast<unsigned long>(enableRc));
+        stopSession();
+        if (why)
+            *why = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted on this system.");
+        return false;
+    }
 
     return true;
 }
@@ -1517,10 +1866,7 @@ QString AppMonitor::fallbackReason() const
     if (!m_impl->etwBlockedReason.isEmpty())
         return m_impl->etwBlockedReason;
     if (m_impl->useEstats)
-        return QStringLiteral("The detailed ETW source is delivering no events on this "
-                              "Windows build, so applications are measured from their TCP "
-                              "connection counters instead: the figures are real, but UDP "
-                              "and QUIC traffic is not counted.");
+        return QStringLiteral("TCP only \u2014 UDP and QUIC are not counted.");
     return QString();
 }
 
@@ -1532,6 +1878,67 @@ bool AppMonitor::usingTcpFallback() const
 quint64 AppMonitor::eventsSeenTotal() const
 {
     return m_impl->eventsSeen.load();
+}
+
+QString AppMonitor::consumerReport() const
+{
+    const QString restarts = m_impl->consumerRestarts.load() > 0
+                                 ? QStringLiteral(", %1 restart(s)").arg(m_impl->consumerRestarts.load())
+                                 : QString();
+    QString state = m_impl->consumerExited.load() && !m_impl->stopping.load()
+                        ? QStringLiteral("stopped (ProcessTrace %1)%2")
+                              .arg(m_impl->consumerExitCode.load())
+                              .arg(restarts)
+                        : (m_impl->consumerExited.load() ? QStringLiteral("stopped") + restarts
+                                                         : QStringLiteral("running") + restarts);
+
+    // The enable is reported alongside: "enabled and silent" and "never enabled" are different
+    // faults, and the code is the only thing that tells them apart.
+    const int attempts = m_impl->providerEnableAttempts.load();
+    if (attempts > 0) {
+        const quint32 rc = m_impl->providerEnableRc.load();
+        state += QStringLiteral(" \u00b7 enable %1, attempt %2%3")
+                     .arg(rc == 0 ? QStringLiteral("ok") : QString::number(rc))
+                     .arg(attempts)
+                     .arg(m_impl->reenableTried.load() ? QStringLiteral(", re-enabled after 5s") : QString());
+    }
+    return state;
+}
+
+QString AppMonitor::eventIdReport() const
+{
+    struct Entry {
+        int id;
+        quint64 count;
+    };
+    QVector<Entry> entries;
+    for (int i = 0; i < 128; ++i) {
+        const quint64 c = m_impl->idCounts[i].load();
+        if (c > 0)
+            entries.append({i, c});
+    }
+    const quint64 overflow = m_impl->idOverflow.load();
+
+    if (entries.isEmpty() && overflow == 0)
+        return QStringLiteral("none yet");
+
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry &a, const Entry &b) { return a.count > b.count; });
+
+    QStringList parts;
+    for (int i = 0; i < entries.size() && i < 12; ++i)
+        parts << QStringLiteral("%1:%2").arg(entries[i].id).arg(entries[i].count);
+    if (entries.size() > 12)
+        parts << QStringLiteral("...");
+    if (overflow > 0)
+        parts << QStringLiteral(">127:%1").arg(overflow);
+
+    return parts.join(QStringLiteral("  "));
+}
+
+quint64 AppMonitor::udpEventsTotal() const
+{
+    return m_impl->udpEvents.load();
 }
 
 quint64 AppMonitor::eventsDecodedTotal() const
@@ -1553,6 +1960,13 @@ bool AppMonitor::start()
     if (state() == MonitorState::Running && !m_starting.load())
         return true;
 
+    // A live session already owns the ETW name. Starting a second one in this process
+    // collides with our own pid-suffixed name, and this build reports that collision as
+    // ACCESS_DENIED - which used to switch a perfectly healthy monitor to the TCP
+    // fallback (and then start a second, nonce-named session that was never stopped).
+    if (m_impl->sessionOwned)
+        return true;
+
     // Without elevation the ETW trace session cannot be created - but that is not
     // the end of monitoring, and treating it as fatal was the second half of the
     // bug that made this feature report "unavailable" while a working source sat
@@ -1563,11 +1977,10 @@ bool AppMonitor::start()
             QMutexLocker lock(&m_impl->mutex);
             m_impl->useEstats = true;
             m_impl->silentTicks = 0;
-            m_impl->etwBlockedReason =
-                QStringLiteral("Flowbit is not running with Administrator rights, so the "
-                               "detailed ETW source is unavailable. Applications are "
-                               "measured from their TCP connection counters instead: the "
-                               "figures are real, but UDP and QUIC traffic is not counted.");
+            // One short line. It sits under a table, so every extra clause costs a row of
+            // data: the full explanation - why the source is unavailable and what that
+            // implies - is in Settings -> Diagnostics, which is where a sentence belongs.
+            m_impl->etwBlockedReason = QStringLiteral("TCP only \u2014 UDP and QUIC are not counted.");
             m_impl->error.clear();
             m_lastTick = std::chrono::steady_clock::now();
             m_tickCount = 0;
@@ -1639,6 +2052,37 @@ void AppMonitor::startAsync()
 
 void AppMonitor::tick()
 {
+
+    // One-shot re-enable. A session can accept an enable and still deliver nothing - the enable can
+    // be swallowed when it lands while the consumer is still attaching, which is exactly what this
+    // ordering change is guarding against. Re-issuing ENABLE_PROVIDER once, after the consumer has
+    // provably had time to attach, costs nothing and has been the difference between a silent
+    // session and a working one. Deliberately once: a provider that still says nothing is a fact to
+    // report, not a call to loop on.
+    if (!m_impl->reenableTried.load() && state() == MonitorState::Running
+        && m_impl->eventsSeen.load() == 0 && m_impl->providerEnableAttempts.load() > 0
+        && m_impl->consumerSeconds() >= 5) {
+        m_impl->reenableTried.store(true);
+        qInfo("Flowbit: no events after 5s - re-enabling the provider once");
+        m_impl->enableProvider();
+    }
+
+    // Self-recovery: a consumer that returned while the session is still wanted is rebuilt.
+    //
+    // Bounded to two attempts per process; beyond that the state is reported rather than retried
+    // forever, because a provider that refuses every consumer is a fact to surface, not a loop to
+    // run.
+    if (m_impl->consumerExited.load() && !m_impl->stopping.load()
+        && state() == MonitorState::Running) {
+        const int attempts = m_impl->consumerRestarts.load();
+        if (attempts < 2) {
+            m_impl->consumerRestarts.fetch_add(1);
+            qInfo("Flowbit: rebuilding the ETW consumer (attempt %d)", attempts + 1);
+            m_impl->stopSession();               // the consumer thread has already returned
+            startAsync();                        // rebuilds on a worker thread, never on the GUI
+        }
+    }
+
     // With the async start the transitional state is Running before the session
     // settles; ticks during that window only stamp the clock.
     if (state() != MonitorState::Running)
@@ -1666,16 +2110,28 @@ void AppMonitor::tick()
     const bool etwUnavailable = !m_impl->etwBlockedReason.isEmpty();
     if (!etwUnavailable) {
         const quint64 seenNow = m_impl->eventsSeen.load();
-        if (m_impl->eventsSeen.load() == m_impl->lastSeenSample) {
-            if (!m_impl->useEstats && ++m_impl->silentTicks >= 3)
-                m_impl->useEstats = true;
-        } else {
+
+        // Traffic witness: the fallback is only fair when the machine was busy and
+        // ETW still said nothing. A quiet connection is not evidence of a broken source.
+        const quint64 sysNow = systemByteCount();
+        const bool systemBusy =
+            m_impl->lastSystemBytes != 0 && sysNow > m_impl->lastSystemBytes;
+        m_impl->lastSystemBytes = sysNow;
+
+        if (seenNow != m_impl->lastSeenSample) {
+            // Events arrived. ETW is proven for the rest of the session, and anything the
+            // fallback was contributing is dropped so the two never double-count.
+            m_impl->etwProven = true;
             m_impl->silentTicks = 0;
             if (m_impl->useEstats) {
-                // ETW recovered; stop feeding from EStats to avoid double counting.
                 m_impl->useEstats = false;
                 m_impl->connLast.clear();
             }
+        } else if (!m_impl->etwProven && systemBusy) {
+            // Silence while bytes moved: only then is it fair to conclude this source
+            // does not work on this build.
+            if (!m_impl->useEstats && ++m_impl->silentTicks >= 3)
+                m_impl->useEstats = true;
         }
         m_impl->lastSeenSample = seenNow;
     }
@@ -1686,10 +2142,28 @@ void AppMonitor::tick()
         m_impl->collectEstats();
 
     m_impl->completeInterval(seconds, seconds);
+    ++m_impl->tickCount;
     if (++m_tickCount % 20 == 0)
         m_impl->sweepDeadPids();
 
     emit updated();
+}
+
+void AppMonitor::stopAsync()
+{
+    // Coalesced like startAsync: pressing Show More repeatedly must not spawn one teardown per
+    // press.
+    bool expected = false;
+    if (!m_stopping.compare_exchange_strong(expected, true))
+        return;
+
+    QThread *t = QThread::create([this] {
+        stop();
+        m_stopping.store(false);
+        QMetaObject::invokeMethod(this, [this] { emit stateChanged(); }, Qt::QueuedConnection);
+    });
+    connect(t, &QThread::finished, t, &QThread::deleteLater);
+    t->start();
 }
 
 void AppMonitor::stop()

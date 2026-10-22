@@ -103,6 +103,18 @@ private:
 
     // Removes the window on screen, keeping the others.
     void deleteCurrent();
+
+    // Puts the dialog into the "this application has no schedules" state, which is reached
+    // by deleting the last window and is the only way to express that in the UI.
+    //
+    // Without it there was no reachable state meaning "none": deleting the last window fell
+    // back to the create form, so Save rebuilt a window and Cancel discarded the deletion.
+    // An application therefore could not be taken off its schedule at all.
+    void enterNoSchedules();
+
+    // Enables or disables the per-window fields without touching the dialog's buttons.
+    void setFieldsEnabled(bool on);
+
     void onUnitChanged(bool download);
 
     QLineEdit *m_name = nullptr;
@@ -121,6 +133,8 @@ private:
     QComboBox *m_upUnit = nullptr;
     QCheckBox *m_enabled = nullptr;
     QLabel *m_error = nullptr;
+    // Explains the empty state when the last window has been deleted.
+    QLabel *m_noneNote = nullptr;
 
     Rule m_rule;
     Rule m_result;
@@ -134,6 +148,9 @@ private:
     bool m_isNew = true;
     bool m_offerAdd = false;
     bool m_loading = false;
+    // True while the dialog is committing "this application has no schedules". Distinct
+    // from merely being empty: a first-time dialog is also empty but must create a window.
+    bool m_none = false;
     // Physical rate per direction, so switching units re-renders the same rate
     // rather than reinterpreting the digits.
     RateBps m_rate[2] = {kUnlimited, kUnlimited};

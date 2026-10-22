@@ -1,12 +1,18 @@
 // Verifies the startup registration against the real Windows registry.
 //
-// The claim to test is narrow and checkable: enabling writes a Run entry naming THIS
+// The claim to test is narrow and checkable: enabling writes a registration naming THIS
 // executable with the --tray-start flag, disabling removes it, and isEnabled() reports the
 // truth in between - including after Flowbit has been moved, which is the case a
 // presence-only check would get wrong.
 //
-// The test restores whatever was there when it started, so running it does not change the
-// machine's startup configuration.
+// IT RUNS UNDER A THROWAWAY NAME, NOT "Flowbit".
+//
+// It used to use the real name, and "restores the machine" did not hold. Run from a build
+// directory the executable path differs from the installed one, so isEnabled() correctly said
+// "a different copy", the test then wrote its own Run value OVER the user's, and on the way
+// out deleted it - destroying a startup entry the user had configured. The mechanism under
+// test is the same either way, so the name is pointed at a name nothing else uses and the
+// real configuration is never read, written or removed.
 
 #include "autostart.h"
 
@@ -29,20 +35,30 @@ void check(bool ok, const QString &what)
         ++g_failures;
 }
 
+// Distinctive enough that it cannot collide with anything a user has configured.
+const char *kTestName = "FlowbitStartupSelfTest";
+
 } // namespace
 
 int main(int argc, char *argv[])
 {
     QCoreApplication app(argc, argv);
 
+    // Everything below now reads and writes a name no user has configured, so the real
+    // "Flowbit" task and Run value are untouched even if the test is interrupted.
+    autostart::setRegistrationName(QString::fromLatin1(kTestName));
+
     std::printf("\n== startup registration ==\n");
+    std::printf("  registered : %s\n", qPrintable(autostart::taskName()));
     std::printf("  executable : %s\n", qPrintable(autostart::executablePath()));
     std::printf("  command    : %s\n", qPrintable(autostart::registeredCommand()));
 
-    // Remember the starting state so the machine is left as it was found.
+    // The throwaway name should not already exist, but start from a known state regardless.
+    QString ignored;
+    autostart::setEnabled(false, &ignored);
     const bool wasEnabled = autostart::isEnabled();
-    const QString originalValue = autostart::registeredValue();
     std::printf("  initially  : %s\n", wasEnabled ? "enabled" : "not registered");
+    check(!wasEnabled, "the throwaway name starts unregistered, so nothing is being clobbered");
 
     // ---- enabling --------------------------------------------------------
     //
@@ -107,14 +123,11 @@ int main(int argc, char *argv[])
               "a command for another location does not match this one");
     }
 
-    // ---- restore ---------------------------------------------------------
-    if (wasEnabled) {
-        autostart::setEnabled(true, &error);
-        std::printf("  restored   : enabled (as found)\n");
-    } else {
-        autostart::setEnabled(false, &error);
-        std::printf("  restored   : not registered (as found)\n");
-    }
+    // ---- leave nothing behind --------------------------------------------
+    // The name is a test-only one, so this is about tidiness rather than restoring the
+    // user's configuration - that was never touched.
+    autostart::setEnabled(false, &error);
+    check(!autostart::isEnabled(), "the throwaway registration is removed, not left behind");
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     std::printf("%s\n", g_failures == 0 ? "test_autostart passed."

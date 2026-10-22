@@ -148,6 +148,55 @@ int main(int argc, char *argv[])
               QStringLiteral("Sat 10:00 does NOT match Mon-Fri rule: ") + describe(saturday));
     }
 
+    // -- an overnight window carries its day mask past midnight -------------
+    //
+    // The after-midnight tail belongs to the day the window STARTED on. Checking the mask
+    // against the current day meant a Monday-only 22:00 -> 07:00 rule stopped dead at
+    // midnight and never covered Tuesday's early hours - configured, displayed correctly, and
+    // never applied.
+    {
+        Settings s;
+        s.enabled = true;
+
+        Rule mondayNight;
+        mondayNight.name = QStringLiteral("Monday Night");
+        mondayNight.from = "22:00";
+        mondayNight.to = "07:00";
+        mondayNight.down = 1 * 1024 * 1024;
+        mondayNight.days = 0x01;   // Monday only
+        s.rules.append(mondayNight);
+
+        check(QDate(2026, 10, 12).dayOfWeek() == Qt::Monday, "fixture 2026-10-12 is Monday");
+
+        const auto day = [](int dayOfMonth, int hour, int minute) {
+            return QDateTime(QDate(2026, 10, dayOfMonth), QTime(hour, minute));
+        };
+
+        const EffectiveLimits monLate = evaluate(s, day(12, 23, 0));
+        check(monLate.throttling && monLate.ruleIndex == 0,
+              QStringLiteral("Monday 23:00 is inside a Monday overnight window: ")
+                  + describe(monLate));
+
+        const EffectiveLimits tueEarly = evaluate(s, day(13, 3, 0));
+        check(tueEarly.throttling && tueEarly.ruleIndex == 0,
+              QStringLiteral("Tuesday 03:00 is still inside it, as the tail of Monday: ")
+                  + describe(tueEarly));
+
+        const EffectiveLimits tueAtEnd = evaluate(s, day(13, 7, 0));
+        check(!tueAtEnd.throttling,
+              QStringLiteral("Tuesday 07:00 is the exclusive end: ") + describe(tueAtEnd));
+
+        const EffectiveLimits tueNight = evaluate(s, day(13, 23, 0));
+        check(!tueNight.throttling,
+              QStringLiteral("Tuesday night is not covered by a Monday-only window: ")
+                  + describe(tueNight));
+
+        const EffectiveLimits monEarly = evaluate(s, day(12, 3, 0));
+        check(!monEarly.throttling,
+              QStringLiteral("Monday 03:00 belongs to Sunday's window, which is not set: ")
+                  + describe(monEarly));
+    }
+
     // -- evaluate: first matching rule wins, disabled rules skipped --------
     {
         Settings s;

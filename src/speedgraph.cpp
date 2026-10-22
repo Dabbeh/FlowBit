@@ -15,7 +15,10 @@ namespace net {
 SpeedGraph::SpeedGraph(QWidget *parent) : QWidget(parent)
 {
     setAttribute(Qt::WA_OpaquePaintEvent, false);
-    setMinimumHeight(90);
+    setMinimumHeight(110);
+    // Grows with the window instead of staying a fixed strip: the card already gives it stretch,
+    // and the plot is drawn from rect() so a larger area is simply a larger graph.
+    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 }
 
 void SpeedGraph::addSample(double downBytesPerSec, double upBytesPerSec)
@@ -79,8 +82,136 @@ void SpeedGraph::paintEvent(QPaintEvent *)
 
     drawGrid(p, plot);
     drawMountain(p, plot, maxValue);
+    drawAverages(p, plot, maxValue);
     drawCeiling(p, plot, maxValue);
     drawAxisLabels(p, plot, maxValue);
+}
+
+double SpeedGraph::averageDown() const
+{
+    if (m_down.isEmpty())
+        return 0.0;
+    double sum = 0.0;
+    for (double v : m_down)
+        sum += v;
+    return sum / double(m_down.size());
+}
+
+double SpeedGraph::averageUp() const
+{
+    if (m_up.isEmpty())
+        return 0.0;
+    double sum = 0.0;
+    for (double v : m_up)
+        sum += v;
+    return sum / double(m_up.size());
+}
+
+void SpeedGraph::separateLabelCentres(qreal *first, qreal *second, qreal minGap, qreal top,
+                                      qreal bottom)
+{
+    if (!first || !second)
+        return;
+
+    if (*second < *first)
+        std::swap(*first, *second);
+
+    const qreal gap = *second - *first;
+    if (gap < minGap) {
+        const qreal push = (minGap - gap) / 2.0;
+        *first -= push;
+        *second += push;
+    }
+
+    // Keep both inside the plot; if the pair cannot fit, prefer the upper one's position.
+    if (*first < top) {
+        const qreal shift = top - *first;
+        *first += shift;
+        *second += shift;
+    }
+    if (*second > bottom) {
+        const qreal shift = *second - bottom;
+        *first = qMax(top, *first - shift);
+        *second = bottom;
+    }
+}
+
+void SpeedGraph::drawAverages(QPainter &p, const QRectF &plot, double maxValue) const
+{
+    if (m_down.isEmpty())
+        return;
+
+    auto yFor = [&](double v) {
+        const double frac = std::clamp(v / maxValue, 0.0, 1.0);
+        return plot.bottom() - frac * plot.height();
+    };
+
+    struct Line {
+        double value;
+        QColor colour;
+        QString label;
+    };
+    const Line lines[] = {
+        {averageDown(), theme::kGraphDownload(), QStringLiteral("avg \u2193")},
+        {averageUp(), theme::kGraphUpload(), QStringLiteral("avg \u2191")},
+    };
+
+    // Which lines are actually drawn, and where their labels want to sit.
+    QVector<QPair<const Line *, qreal>> shown;
+    for (const Line &line : lines) {
+        if (line.value > 0.0)
+            shown.append({&line, yFor(line.value)});
+    }
+    if (shown.isEmpty())
+        return;
+
+    // Two labels, separated if they would overlap.
+    if (shown.size() == 2) {
+        qreal first = shown[0].second;
+        qreal second = shown[1].second;
+        const qreal badgeHeight = QFontMetricsF(theme::uiFont(8, false)).height() + 6.0;
+        separateLabelCentres(&first, &second, badgeHeight + 2.0, plot.top() + badgeHeight / 2.0,
+                             plot.bottom() - badgeHeight / 2.0);
+        shown[0].second = first;
+        shown[1].second = second;
+    }
+
+    const QFont labelFont = theme::uiFont(8, false);
+    p.setFont(labelFont);
+    const QFontMetricsF metrics(labelFont);
+
+    for (const auto &entry : shown) {
+        const Line &line = *entry.first;
+
+        // The average itself: a dashed rule across the plot.
+        QPen pen(line.colour, 1, Qt::DashLine);
+        pen.setDashPattern({4, 3});
+        p.setPen(pen);
+        p.drawLine(QPointF(plot.left(), entry.second), QPointF(plot.right(), entry.second));
+
+        // The label, on its own opaque badge.
+        //
+        // Drawn straight onto the trace before this, in muted grey: over the filled mountain it was
+        // unreadable, and with both averages near zero the two labels overprinted each other. A
+        // filled badge in the card's own colour makes it legible whatever is behind it, and the
+        // text uses the direction colour so the label belongs to its line.
+        const QString text = QStringLiteral("%1 %2").arg(line.label, formatRate(line.value));
+        const QRectF textBounds = metrics.boundingRect(text);
+        const qreal badgeWidth = textBounds.width() + 10.0;
+        const qreal badgeHeight = textBounds.height() + 5.0;
+        QRectF badge(plot.left() + 4.0, entry.second - badgeHeight / 2.0, badgeWidth, badgeHeight);
+        if (badge.top() < plot.top())
+            badge.moveTop(plot.top());
+        if (badge.bottom() > plot.bottom())
+            badge.moveBottom(plot.bottom());
+
+        p.setPen(QPen(theme::kBorder(), 1));
+        p.setBrush(theme::kPanel());
+        p.drawRoundedRect(badge, 3, 3);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(line.colour);
+        p.drawText(badge, Qt::AlignCenter, text);
+    }
 }
 
 void SpeedGraph::drawGrid(QPainter &p, const QRectF &plot) const

@@ -22,10 +22,10 @@ if ($LASTEXITCODE -ne 0) { throw 'moc failed for applimitengine.h' }
 & "$qt\bin\moc.exe" "-I$root\src" "-I$wd\include" (Join-Path $root 'src\throttleengine.h') `
     -o (Join-Path $mocOut 'moc_throttleengine.cpp')
 if ($LASTEXITCODE -ne 0) { throw 'moc failed for throttleengine.h' }
-& "$qt\bin\moc.exe" "-I$root\src" (Join-Path $root 'src\settingsstore.h') `
-    -o (Join-Path $mocOut 'moc_settingsstore.cpp')
-if ($LASTEXITCODE -ne 0) { throw 'moc failed for settingsstore.h' }
 
+# settingsstore.h is NOT moc'd: it declares no Q_OBJECT, so moc (Qt 6.10) writes no file and
+# says so. The script used to run it anyway and then compile the file it expected, which never
+# existed - so this suite could not build at all.
 $sources = @(
     "$root\tools\test_applimit.cpp"
     "$root\src\applimitengine.cpp"
@@ -35,7 +35,6 @@ $sources = @(
     "$root\src\units.cpp"
     (Join-Path $mocOut 'moc_applimitengine.cpp')
     (Join-Path $mocOut 'moc_throttleengine.cpp')
-    (Join-Path $mocOut 'moc_settingsstore.cpp')
 )
 
 $exe = Join-Path $out 'test_applimit.exe'
@@ -61,9 +60,19 @@ if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
 Write-Host '==> running' -ForegroundColor Cyan
 $env:QT_QPA_PLATFORM = 'offscreen'
 Push-Location $out
-& $exe
-$rc = $LASTEXITCODE
-Pop-Location
+# The engine logs to stderr; with ErrorActionPreference='Stop' under PowerShell 7 that ends the
+# script with a NativeCommandError, so the suite aborted instead of reporting. The exit code is
+# what decides pass or fail.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    & $exe
+    $rc = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previous
+    Pop-Location
+}
 
 if ($rc -ne 0) { throw "test_applimit reported failures (exit $rc)" }
 Write-Host ''

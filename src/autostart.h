@@ -34,6 +34,17 @@ QString registeredCommand();
 // The name the scheduled task is registered under.
 QString taskName();
 
+// Overrides the name used by BOTH mechanisms. Pass an empty string to restore "Flowbit".
+//
+// This exists so tools/test_autostart.cpp can drive the real code paths without touching the
+// user's actual startup configuration. It was added because that test did exactly the
+// opposite: run from a build directory its executable path differs from the installed one, so
+// isEnabled() saw "a different copy", the test wrote its own Run value over the user's, and
+// then deleted it on the way out - silently removing the user's startup entry.
+//
+// The application itself never calls this.
+void setRegistrationName(const QString &name);
+
 // True when startup is configured by EITHER mechanism, and points at this executable.
 //
 // Both are checked: reporting "off" while a Run entry existed would let the user turn the

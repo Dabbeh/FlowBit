@@ -1,4 +1,4 @@
-﻿# Builds and runs Flowbit's unit tests (schedule rules, units, pacer math).
+# Builds and runs Flowbit's unit tests (schedule rules, units, pacer math).
 # These need no Administrator rights and touch no network.
 $ErrorActionPreference = 'Stop'
 
@@ -49,11 +49,19 @@ function Invoke-Test {
 
     Write-Host "==> running $Name" -ForegroundColor Cyan
     Push-Location $out
+    # Tests legitimately write to stderr - test_usage prints a line when Flowbit rejects a
+    # corrupt usage file, which is the behaviour being checked. Under PowerShell 7 with
+    # ErrorActionPreference='Stop' a native program's stderr arrives as a NativeCommandError
+    # and terminates the whole script, so the suite aborted part-way through and looked like a
+    # failure in whichever test happened to be running. The exit code is what decides it.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         & $exe
         $rc = $LASTEXITCODE
     }
     finally {
+        $ErrorActionPreference = $previous
         Pop-Location
     }
     if ($rc -ne 0) { throw "$Name reported failures" }
@@ -101,7 +109,9 @@ if ($LASTEXITCODE -ne 0) { throw 'test_toggle failed to compile' }
 Write-Host "==> running test_toggle" -ForegroundColor Cyan
 $env:QT_QPA_PLATFORM = 'offscreen'
 Push-Location $out
-try { & $toggleExe; $rc = $LASTEXITCODE } finally { Pop-Location }
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'   # see Invoke-Test: stderr is not a failure signal
+try { & $toggleExe; $rc = $LASTEXITCODE } finally { $ErrorActionPreference = $previous; Pop-Location }
 if ($rc -ne 0) { throw 'test_toggle reported failures' }
 
 Write-Host "`nAll tests passed." -ForegroundColor Green

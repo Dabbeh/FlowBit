@@ -37,6 +37,27 @@ machine to re-derive the whole table (`etw_schema_dump.exe <out.log>`, elevated)
 | **18** | TCP ... (IPv4) | same shape as 11 |
 | **26–32** | the IPv6 equivalents | same, but **daddr/saddr are `Binary`** |
 
+### UDP
+
+The TCP ids above are not the whole provider. UDP is published under a separate id range, and
+omitting it is invisible rather than obviously broken: a TCP-only decoder counts working
+traffic, reports a healthy decode rate, and simply never mentions UDP.
+
+| ID | Meaning |
+|----|---------|
+| **42** | UDP send (IPv4) |
+| **43** | UDP receive (IPv4) |
+| **58** | UDP send (IPv6) |
+| **59** | UDP receive (IPv6) |
+
+**QUIC needs no handling of its own.** It is a UDP protocol, so 42/43/58/59 is precisely what
+makes QUIC — along with DNS, WireGuard, DHCP and game traffic — appear in the application
+list. Anything that shows these applications as using nothing is missing these four ids.
+
+Measured on a live session: `42` and `43` together accounted for 62,073 events where the
+application's own "UDP events counted" read 62,073 — an exact match, which is the check that
+the UDP mapping is right rather than plausible.
+
 ### The critical facts
 
 1. **`PID` is a top-level property (UInt32)** — not only in the event header.
@@ -64,11 +85,12 @@ machine to re-derive the whole table (`etw_schema_dump.exe <out.log>`, elevated)
    `PID` (property 0) or a TCP option field. The name `size` must be matched
    explicitly.
 
-6. **We only count ids 10, 11, 12, 13** (TCP send/receive, UDP send/receive in the
-   classic interpretation) — but note that in this schema 12/13 are TCP
-   connect/disconnect, whose `size` is typically 0. The byte-carrying events are
-   **10 and 11**. Treating 12/13 as "UDP" (as earlier code comments claimed) is
-   wrong for this provider revision.
+6. **The counted set is 10, 11, 14 and 26, 27, 30 (TCP), plus 42, 43 and 58, 59 (UDP).**
+   Those are the byte-carrying operations. Ids 12/13 are TCP connect/disconnect, whose `size`
+   is normally 0, so counting them inflates the event count without adding bytes — and an
+   earlier comment describing 12/13 as "UDP" was simply wrong for this provider revision.
+   The full mapping lives in `src/appmonitor.h` (`appmonitor::isCountedTransferId`) so it can
+   be checked without an elevated session.
 
 ## What went wrong in the app (recorded so it is not repeated)
 
@@ -105,7 +127,13 @@ and the app's diagnostics report is the verification surface of record.
 ## Verification commands
 
 ```powershell
-# re-derive the schema on any machine (elevated)
+# The schema and each event's properties, WITHOUT an ETW session and WITHOUT elevation.
+# Reads the manifest Windows already has registered, so it works from an ordinary shell -
+# this is the quickest way to answer "does event N carry a size field?".
+g++ -std=gnu++17 -O1 -DWIN32 -DUNICODE -D_UNICODE tools/etw_manifest_probe.cpp -o etw_manifest_probe.exe
+.\etw_manifest_probe.exe
+
+# re-derive the schema from a live session on any machine (elevated)
 build\probe\etw_schema_dump.exe kernel_network_schema.log
 
 # live counters, after generating traffic, in the app:
@@ -113,3 +141,20 @@ build\probe\etw_schema_dump.exe kernel_network_schema.log
 #   -> "ETW events received: N (decoded: M)"  (M should be ~N)
 #   -> "ETW event layout" lists every id with its fields
 ```
+
+### Measured with the manifest probe
+
+Every counted id publishes `size` — the field `src/appmonitor.cpp` reads by name:
+
+| ids | properties |
+|-----|-----------|
+| 42, 43, 58, 59 (UDP) | PID, size, daddr, saddr, dport, sport, seqnum, connid |
+| 11, 13, 14, 16, 18 | same eight |
+| 10, 26 | the eight plus startime/endtime |
+| 12, 15, 28, 31 | the eight plus mss, sackopt, tsopt, wsopt, rcvwin, rcvwinscale, sndwinscale |
+| 17 | Proto, FailureCode — no size, correctly excluded |
+
+**Id 18 is the standing exception.** It publishes `size` like the receive ids, but it is not
+counted: its layout matches the receive/retransmit ids, so summing it with 10/11 would risk
+counting the same bytes twice, and over-counting is worse than under-counting. Settling it needs
+a live capture comparing the byte totals of 10 + 11 against 18 over the same interval.

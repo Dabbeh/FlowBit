@@ -45,6 +45,7 @@ $sources = @(
     "$root\src\appactivitypanel.cpp",
     "$root\src\appnames.cpp",
     "$root\src\appmonitor.cpp",
+"$root\src\etwclass.cpp",
     "$root\src\diagnosticspanel.cpp",
     "$root\src\diagnostics.cpp",
     "$root\src\appruledialog.cpp",
@@ -106,11 +107,16 @@ $env:QT_QPA_PLATFORM = 'offscreen'
 Remove-Item -Recurse -Force (Join-Path $out 'appmon_scratch') -ErrorAction SilentlyContinue
 
 Push-Location $out
+# The monitor logs to stderr; with ErrorActionPreference='Stop' under PowerShell 7 that ends the
+# script with a NativeCommandError instead of reporting. The exit code decides pass or fail.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
 try {
     & $exe
     $rc = $LASTEXITCODE
 }
 finally {
+    $ErrorActionPreference = $previous
     Pop-Location
 }
 

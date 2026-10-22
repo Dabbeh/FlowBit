@@ -254,6 +254,18 @@ ScheduleDialog::ScheduleDialog(const Rule &rule, bool isNew, QWidget *parent,
     root->addWidget(m_enabled);
 
     // -- inline validation message ------------------------------------------
+    // Shown only in the empty state, so the consequence of deleting the last window is
+    // stated before Save rather than discovered afterwards.
+    m_noneNote = new QLabel(
+        QStringLiteral("This application has no schedules.\n\n"
+                       "Save to remove the one you deleted. It will then be limited all the "
+                       "time while it is enabled, instead of only during a window."),
+        this);
+    m_noneNote->setObjectName(QStringLiteral("sub"));
+    m_noneNote->setWordWrap(true);
+    m_noneNote->hide();
+    root->addWidget(m_noneNote);
+
     m_error = new QLabel(this);
     m_error->setObjectName(QStringLiteral("error"));
     m_error->setWordWrap(true);
@@ -300,6 +312,9 @@ ScheduleDialog::ScheduleDialog(const Rule &rule, bool isNew, QWidget *parent,
 bool ScheduleDialog::hasUnsavedChanges() const
 {
     if (m_loading || !m_from || !m_to || !m_name)
+        return false;
+    // The empty state carries no window to lose, so closing from it never nags.
+    if (m_none)
         return false;
     const Rule now = const_cast<ScheduleDialog *>(this)->buildRule();
 
@@ -349,9 +364,11 @@ void ScheduleDialog::refreshSelector()
 
     // Shown only when there is a window to move between. While creating one, or when the
     // application has none, the dropdown would be an empty control.
-    const bool show = !m_isNew && !m_choices.isEmpty();
+    const bool show = !m_isNew && !m_choices.isEmpty() && !m_none;
     m_existingSection->setVisible(show);
-    m_addButton->setVisible(!m_choices.isEmpty());
+    // Kept reachable in the empty state, so deleting the last window is still undoable
+    // without cancelling and starting over.
+    m_addButton->setVisible(!m_choices.isEmpty() || m_none);
 
     if (!show)
         return;
@@ -443,6 +460,13 @@ void ScheduleDialog::addWindow()
 {
     if (!confirmDiscard())
         return;
+
+    // Coming back from the empty state, so the fields and the note go away with it.
+    m_none = false;
+    if (m_noneNote)
+        m_noneNote->hide();
+    setFieldsEnabled(true);
+
     storeCurrentEdits();
 
     // Create mode. The name is kept - it is the application's name and every window of
@@ -497,23 +521,69 @@ void ScheduleDialog::deleteCurrent()
     }
 
     if (m_choices.isEmpty()) {
-        // The last one went, so there is nothing to select and the dialog returns to the
-        // form it shows the first time.
-        Rule fresh;
-        fresh.id = 0;
-        fresh.name = m_rule.name;
-        fresh.down = kUnlimited;
-        fresh.up = kUnlimited;
-        m_isNew = true;
-        loadWindow(fresh);
-        setWindowTitle(QStringLiteral("Add Schedule"));
-        if (m_saveButton)
-            m_saveButton->setText(QStringLiteral("Save Rule"));
+        // The last window went. This used to fall back to the create form, which meant the
+        // removal could never be saved: Save rebuilt a window from that form, and Cancel
+        // discarded the deletion. The empty state is now a real answer of its own.
+        enterNoSchedules();
     } else {
         m_isNew = false;
         loadWindow(m_choices.first());
     }
     refreshSelector();
+}
+
+// "This application has no schedules" - reachable, saveable, and distinct from the
+// first-time dialog, which is also blank but is meant to create a window.
+void ScheduleDialog::enterNoSchedules()
+{
+    m_none = true;
+    m_isNew = false;
+    m_currentId = 0;
+
+    m_loading = true;
+    m_name->clear();
+    m_from->clear();
+    m_to->clear();
+    if (m_days)
+        m_days->setMask(0);
+    if (m_down)
+        m_down->setValue(0.0);
+    if (m_up)
+        m_up->setValue(0.0);
+    if (m_enabled)
+        m_enabled->setChecked(false);
+    m_loading = false;
+
+    // Nothing on screen describes a window any more, so the fields are inert rather than
+    // showing values that would not be stored.
+    setFieldsEnabled(false);
+
+    if (m_timeFeedback) {
+        m_timeFeedback->clear();
+        m_timeFeedback->setStyleSheet(QString());
+    }
+    if (m_error)
+        m_error->hide();
+    if (m_noneNote)
+        m_noneNote->show();
+
+    setWindowTitle(QStringLiteral("Remove Schedule"));
+    if (m_saveButton)
+        m_saveButton->setText(QStringLiteral("Remove Schedule"));
+}
+
+void ScheduleDialog::setFieldsEnabled(bool on)
+{
+    // Deliberately not setEnabled() on the dialog: that would take Save and Cancel with it,
+    // and the whole point of this state is that Save is still reachable.
+    for (QWidget *w : {static_cast<QWidget *>(m_name), static_cast<QWidget *>(m_from),
+                       static_cast<QWidget *>(m_to), static_cast<QWidget *>(m_days),
+                       static_cast<QWidget *>(m_down), static_cast<QWidget *>(m_downUnit),
+                       static_cast<QWidget *>(m_up), static_cast<QWidget *>(m_upUnit),
+                       static_cast<QWidget *>(m_enabled)}) {
+        if (w)
+            w->setEnabled(on);
+    }
 }
 
 void ScheduleDialog::reject()
@@ -644,6 +714,15 @@ Rule ScheduleDialog::buildRule() const
 
 void ScheduleDialog::accept()
 {
+    // The empty state IS the answer: nothing to validate, and `result()` deliberately stays
+    // id 0 so the caller writes no window back. Requiring a valid window here is precisely
+    // what made removing the last schedule impossible.
+    if (m_none) {
+        m_result = Rule{};
+        QDialog::accept();
+        return;
+    }
+
     const QString problem = validationError();
     if (!problem.isEmpty()) {
         // Report the reason and stay open: no rule is created.

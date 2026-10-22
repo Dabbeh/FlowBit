@@ -236,16 +236,31 @@ bool ruleMatches(const Rule &rule, const QDateTime &when)
     if (!rule.enabled)
         return false;
 
-    if (!maskContainsDay(rule.days, when.date().dayOfWeek()))
-        return false;
-
     const int from = minutesOfDay(parseClock(rule.from));
     const int to = minutesOfDay(parseClock(rule.to));
     if (from < 0 || to < 0)
         return false;  // malformed times never match
 
     const int nowMinutes = when.time().hour() * 60 + when.time().minute();
-    return windowContains(from, to, nowMinutes);
+    if (!windowContains(from, to, nowMinutes))
+        return false;
+
+    // Which day the window BELONGS to, which is not always today.
+    //
+    // An overnight window is one span of time that crosses midnight, so its after-midnight
+    // tail is part of the previous day's occurrence. Checking the mask against today meant a
+    // Monday-only 22:00 -> 07:00 window stopped dead at midnight and never limited Tuesday's
+    // early hours - the window looked configured and simply did not apply. The tail now
+    // counts against the day the window started on.
+    //
+    // Windows that do not cross midnight are unaffected, and so is the every-day case: a
+    // daily mask contains both days, so it matches either way.
+    int dayOffset = 0;
+    if (from > to && nowMinutes < to)
+        dayOffset = -1;
+
+    const QDate owner = when.date().addDays(dayOffset);
+    return maskContainsDay(rule.days, owner.dayOfWeek());
 }
 
 EffectiveLimits evaluate(const Settings &settings, const QDateTime &now)

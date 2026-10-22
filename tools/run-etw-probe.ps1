@@ -11,7 +11,10 @@
 # If StartTrace answers 5 even when elevated, the block is environmental (security
 # software / policy) and no amount of application code can work around it.
 
-$srcRoot = 'C:\Users\enaya\Desktop\Flowbit-Source'
+# The project this script belongs to. It used to be hard-coded to one machine's Desktop under a
+# directory name ("Flowbit-Source") that no longer exists, so the probe was never found and the
+# script always exited before doing anything.
+$srcRoot = Split-Path -Parent $PSScriptRoot
 $outDir = "$srcRoot\build\tests\etwprobe"
 $probe = Join-Path $outDir 'etw_probe.exe'
 $out = Join-Path $env:TEMP 'etw_probe_result.txt'

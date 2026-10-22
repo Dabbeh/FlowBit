@@ -178,10 +178,16 @@ void AppLimitCard::rebuild()
     if (m_icon)
         m_icon->setToolTip(m_rule.path.isEmpty() ? m_rule.exe : m_rule.path);
 
+    // A schedule window may carry its own limits, so while one is in force the card shows
+    // what is actually being applied rather than the application's base rates. With nothing
+    // active it shows the base rates, which is what will apply once a window opens.
+    const RateBps shownDown = m_state.active ? m_state.down : m_rule.down;
+    const RateBps shownUp = m_state.active ? m_state.up : m_rule.up;
+
     if (m_downValue)
-        m_downValue->setText(limitText(m_rule.down));
+        m_downValue->setText(limitText(shownDown));
     if (m_upValue)
-        m_upValue->setText(limitText(m_rule.up));
+        m_upValue->setText(limitText(shownUp));
 
     if (m_enabled) {
         QSignalBlocker block(m_enabled);

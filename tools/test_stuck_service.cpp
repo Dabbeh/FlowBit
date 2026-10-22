@@ -21,6 +21,7 @@
 #include "usagetracker.h"
 #include "sidebar.h"
 #include "theme.h"
+#include "project_paths.h"
 
 #include <QApplication>
 #include <QElapsedTimer>
@@ -75,7 +76,7 @@ int main(int argc, char *argv[])
     std::printf("\n== the stuck-service repair, and whether users get it ===\n");
 
     const QString engine =
-        read(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/src/throttleengine.cpp"));
+        read(project::file(QStringLiteral("src/throttleengine.cpp")));
     check(!engine.isEmpty(), "the engine source is readable");
 
     if (!engine.isEmpty()) {
@@ -121,8 +122,7 @@ int main(int argc, char *argv[])
     //
     // Clearing it helps machines that have it; not creating it matters more.
     {
-        const QString iss =
-            read(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/installer/flowbit.iss"));
+        const QString iss = read(project::file(QStringLiteral("installer/flowbit.iss")));
         check(!iss.isEmpty(), "the installer script is readable");
         if (!iss.isEmpty()) {
             check(!iss.contains(QStringLiteral("Parameters: \"delete WinDivert\"")),
@@ -130,8 +130,8 @@ int main(int argc, char *argv[])
             check(iss.contains(QStringLiteral("flowbit-remove-driver.ps1")),
                   "it runs the script that waits for the driver to unload first");
 
-            const QString script = read(QStringLiteral(
-                "C:/Users/enaya/Desktop/Flowbit-Source/installer/flowbit-remove-driver.ps1"));
+            const QString script =
+                read(project::file(QStringLiteral("installer/flowbit-remove-driver.ps1")));
             check(!script.isEmpty(), "and that script is present");
             check(script.contains(QStringLiteral("'STOPPED'")),
                   "the script polls for the stopped state rather than sleeping and hoping");

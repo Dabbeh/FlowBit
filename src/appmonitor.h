@@ -88,6 +88,14 @@ public:
 
     void stop();
 
+    // Same teardown as stop(), on a worker thread.
+    //
+    // stop() can spin for up to a second waiting on an in-flight start and then stops the trace
+    // session. The activity panel calls it every time it collapses, from a deferred lambda on the
+    // GUI thread - so collapsing the panel could freeze the window. Nothing about the teardown
+    // needs the GUI thread.
+    void stopAsync();
+
     MonitorState state() const { return m_state.load(); }
     bool isRunning() const { return state() == MonitorState::Running; }
 
@@ -95,6 +103,12 @@ public:
     // the panel uses this to show a "Starting" state instead of prematurely
     // claiming "nothing is using the network".
     bool isStarting() const { return m_starting.load(); }
+
+    // Seconds of monitoring in this session (one tick per second, reset on start).
+    //
+    // Needed by diagnostics to tell "the source is broken" from "the panel was never opened" and
+    // from "nothing has transferred yet" - three states that all read as zero events.
+    int runningSeconds() const { return m_tickCount; }
 
     // Human-readable reason for the current Unavailable state, or empty.
     QString errorString() const;
@@ -106,6 +120,17 @@ public:
     // which are entirely different fixes.
     quint64 eventsSeenTotal() const;
     quint64 eventsDecodedTotal() const;
+
+    // UDP events counted in this session. Zero while ETW is the source and UDP traffic has
+    // flowed means the protocol is not arriving, which is worth being able to see.
+    quint64 udpEventsTotal() const;
+
+    // Which event ids the provider is actually delivering, as "id:count" pairs.
+    QString eventIdReport() const;
+
+    // State of the ETW consumer thread: "running", or how it stopped.
+    // A session can be active while its consumer is dead, which reads as zero events.
+    QString consumerReport() const;
 
     // True while the panel is being fed from the TCP EStats fallback instead of
     // ETW (some Windows builds deliver zero kernel-network events). TCP-only is
@@ -202,6 +227,7 @@ private:
 
     std::atomic<MonitorState> m_state{MonitorState::Stopped};
     std::atomic<bool> m_starting{false};   // startAsync worker in flight
+    std::atomic<bool> m_stopping{false};   // stopAsync worker in flight
     // Interval bookkeeping for tick()-driven snapshots (owned by the GUI thread).
     std::chrono::steady_clock::time_point m_lastTick{};
     int m_tickCount = 0;

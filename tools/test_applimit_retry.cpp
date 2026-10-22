@@ -23,6 +23,7 @@
 
 #include "applimitengine.h"
 #include "throttleengine.h"
+#include "project_paths.h"
 
 #include <QCoreApplication>
 #include <QFile>
@@ -44,14 +45,6 @@ void check(bool ok, const QString &what)
         ++g_failures;
 }
 
-QString read(const QString &path)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly))
-        return QString();
-    return QString::fromUtf8(f.readAll());
-}
-
 } // namespace
 
 int main(int argc, char *argv[])
@@ -60,8 +53,7 @@ int main(int argc, char *argv[])
 
     std::printf("\n== the application-limiter's open path ==\n");
 
-    const QString src =
-        read(QStringLiteral("C:/Users/enaya/Desktop/Flowbit-Source/src/applimitengine.cpp"));
+    const QString src = project::read(QStringLiteral("src/applimitengine.cpp"));
     check(!src.isEmpty(), "the engine source is readable");
 
     if (!src.isEmpty()) {
@@ -75,8 +67,11 @@ int main(int argc, char *argv[])
         check(repairAt > openAt,
               "a refused open calls ensureDriverReady before reporting a failure");
 
-        // 3. and it retries, rather than repairing and then reporting the old error
-        const int retryAt = src.indexOf(QStringLiteral("netHandle = WinDivertOpen"), openAt + 10);
+        // 3. and it retries, rather than repairing and then reporting the old error.
+        //    The open now goes through a per-direction helper, so the retry is a second
+        //    call to that helper rather than a second literal WinDivertOpen.
+        const int retryAt =
+            src.indexOf(QStringLiteral("openNetwork(\"inbound\")"), openAt + 10);
         check(retryAt > openAt, "and the open is attempted a second time after the repair");
 
         // 4. the retry is guarded - it happens only for the codes a repair can help with.

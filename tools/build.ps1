@@ -24,8 +24,22 @@ try {
     # a native command writing to stderr can abort the script even when the build
     # SUCCEEDED. Determine success from the exit code and the produced binary
     # rather than from the presence of stderr text.
-    $makeOutput = & mingw32-make -j8 2>&1 | Out-String
-    $makeExit = $LASTEXITCODE
+    #
+    # The preference has to be relaxed around the call for that to hold: merely merging the
+    # stream with 2>&1 is not enough, because PowerShell 7 turns a native program's stderr into
+    # ErrorRecords that terminate under 'Stop'. That is exactly what happened here - the build
+    # was succeeding and the script still aborted on the first compiler warning.
+    $makeOutput = ''
+    $makeExit = 0
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $makeOutput = & mingw32-make -j8 2>&1 | Out-String
+        $makeExit = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
     $makeOutput | Where-Object { $_ -match 'warning:' } |
         Select-Object -First 20 | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
     if ($makeExit -ne 0) {
