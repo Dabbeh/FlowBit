@@ -21,6 +21,7 @@ $env:Path = "$mingwBin;$qtBin;$env:Path"
 
 & $moc "-I$srcRoot\src" "-I$qtInc" "$srcRoot\src\appmonitor.h" -o (Join-Path $outDir 'moc_appmonitor.cpp')
 
+
 $sources = @(
     "$srcRoot\tools\test_monitor_fallback.cpp",
     "$srcRoot\src\appmonitor.cpp",

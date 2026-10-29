@@ -46,8 +46,17 @@ The URL in the next step is what the updater downloads, so the asset has to be n
 {
   "version": "1.1.0",
   "url": "https://github.com/Dabbeh/FlowBit/releases/download/v1.1.0/Flowbit.exe",
+  "sha256": "lowercase SHA-256 of Flowbit.exe",
   "notes": "What changed, in a sentence. Shown in the offer before anything is downloaded."
 }
+```
+
+`sha256` is required whenever the version is newer. It is the SHA-256 of the exact
+executable uploaded in step 2; the updater will not offer a version without one, and
+will delete a download that does not match. Compute it from the built file:
+
+```powershell
+(Get-FileHash .\Flowbit.exe -Algorithm SHA256).Hash.ToLower()
 ```
 
 Commit that to `main`. Every Flowbit with automatic checks on will see it within one start.
@@ -61,8 +70,8 @@ https://github.com/Dabbeh/FlowBit/releases/latest/download/Flowbit.exe
 ```
 
 That URL always resolves to the newest published release, so the file only has to change
-when the **version number** changes - which it does every release anyway. It is the simpler
-form and the one to prefer:
+when the **version number** changes - which it does every release anyway - along with the
+**checksum** of the new executable. It is the simpler form and the one to prefer:
 
 | | |
 |---|---|
@@ -79,9 +88,10 @@ is only where to fetch it from once accepted.
    the whole file is downloaded before anything is replaced.
 3. On acceptance the file downloads with a progress window, which can be cancelled. A
    cancelled or failed download leaves nothing behind.
-4. The new executable is written beside the running one and handed to a PowerShell helper,
-   which waits for Flowbit to exit, copies it over, verifies the copy by hash, and starts
-   Flowbit again elevated.
+4. The new executable is written beside the running one and checked against the published
+   SHA-256, then handed to a PowerShell helper. The helper waits for Flowbit to exit, copies
+   the file beside the target, verifies it again, moves it into place, and starts Flowbit
+   again elevated.
 
 ## Why a helper script rather than Flowbit updating itself
 

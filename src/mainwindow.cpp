@@ -1,5 +1,7 @@
 #include "mainwindow.h"
 
+#include <QThread>
+
 #include "appactivitypanel.h"
 #include "diagnosticspanel.h"
 #include "applimitengine.h"
@@ -192,9 +194,21 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
         // Advance the monitoring intervals first, then redraw what they produced.
         // The 1s cadence is what keeps the per-application graph ticking; without
         // this driver the ingested bytes never became a finished snapshot.
-        if (m_appMonitor && m_appMonitor->isRunning())
+        // The monitor tick must keep running: it is what turns ingested bytes into finished
+        // intervals, and the usage totals depend on it whether or not anything is on screen.
+        // Skipped for the ~300ms a tween runs: tick() formats and sorts every application, and
+        // doing that between two animation frames is what the measured 20-30ms stalls were.
+        // Nothing is lost by waiting - ingest() keeps accumulating under its own lock, and the
+        // next tick finalises the same interval.
+        const bool tweenRunning = m_appPanel && m_appPanel->isAnimating();
+        if (!tweenRunning && m_appMonitor && m_appMonitor->isRunning())
             m_appMonitor->tick();
-        if (m_appPanel && m_appPanel->isExpanded())
+
+        // The panel refresh is pure presentation - it re-sorts, re-formats and rebuilds rows.
+        // Doing that while Flowbit sits in the tray, or while another page is showing, was work
+        // whose only result was thrown away on the next tick.
+        if (m_appPanel && m_appPanel->isExpanded() && m_appPanel->isVisible()
+            && !m_appPanel->isAnimating())
             m_appPanel->refresh();
     });
     m_appRefreshTimer->start();
@@ -334,7 +348,7 @@ void MainWindow::onAppRuleAdd()
 
     Settings settings = m_store->load();
     settings.appRules.append(rule);
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -358,7 +372,7 @@ void MainWindow::onAppRuleEdit(quint64 id)
     result.windows = edited.windows;         // owned by the schedule dialog
 
     settings.appRules[index] = result;
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -382,7 +396,7 @@ void MainWindow::onAppRuleDelete(quint64 id)
         return;
 
     settings.appRules.remove(index);
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -397,7 +411,7 @@ void MainWindow::onAppRuleEnabledChanged(quint64 id, bool enabled)
         return;
 
     settings.appRules[index].enabled = enabled;
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -491,7 +505,7 @@ void MainWindow::onAppRuleSchedule(quint64 id)
         rule.windows.append(extra);
     }
 
-    m_store->save(settings);
+    persistSettings(settings, QStringLiteral("your settings"));
     persistAndApply();
 }
 
@@ -1173,12 +1187,45 @@ QWidget *MainWindow::buildStatisticsPage()
         QFrame *card = makeCard(QStringLiteral("Cycle Controls"), body);
         auto *cl = qobject_cast<QVBoxLayout *>(card->layout());
         auto *note = new QLabel(
-            QStringLiteral("The quota, cycle length and reset buttons are on the Dashboard, "
-                           "so both views act on the same recorded usage."),
+            QStringLiteral("The quota and cycle length are set on the Dashboard. Resetting "
+                           "usage here changes no settings, limits or schedules."),
             card);
         note->setObjectName(QStringLiteral("sub"));
         note->setWordWrap(true);
         cl->addWidget(note);
+
+        auto *row = new QHBoxLayout();
+        row->setSpacing(10);
+        row->addStretch(1);
+
+        auto *resetUsage = new QPushButton(QStringLiteral("Reset usage statistics"), card);
+        resetUsage->setObjectName(QStringLiteral("danger"));
+        resetUsage->setCursor(Qt::PointingHandCursor);
+        resetUsage->setToolTip(QStringLiteral(
+            "Deletes all recorded usage and the per-application history."));
+        connect(resetUsage, &QPushButton::clicked, this, [this] {
+            const auto answer = QMessageBox::question(
+                this, QStringLiteral("Reset usage statistics"),
+                QStringLiteral("Delete every recorded usage total and the per-application "
+                               "history?\n\nYour settings, limits and schedules are kept."),
+                QMessageBox::Reset | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (answer != QMessageBox::Reset)
+                return;
+
+            const int failed = m_usage->resetAllUsage();
+            refreshUsage();
+            refreshStatistics();
+            if (failed > 0) {
+                QMessageBox::warning(
+                    this, QStringLiteral("Reset usage statistics"),
+                    QStringLiteral("%1 usage file(s) could not be deleted, so old figures may "
+                                   "return after a restart.").arg(failed));
+            } else {
+                statusBar()->showMessage(QStringLiteral("Usage statistics cleared"), 4000);
+            }
+        });
+        row->addWidget(resetUsage);
+        cl->addLayout(row);
 
         auto *go = new QPushButton(QStringLiteral("Open Usage Controls"), card);
         go->setObjectName(QStringLiteral("ghost"));
@@ -1252,8 +1299,7 @@ QWidget *MainWindow::buildSettingsPage()
                         return;
                     Settings s = m_store->load();
                     s.themeMode = Settings::ThemeMode(m_pageThemeCombo->currentData().toInt());
-                    QString error;
-                    m_store->save(s, &error);
+                    persistSettings(s, QStringLiteral("the theme"));
                     theme::setMode(s.themeMode == Settings::ThemeMode::Light
                                        ? theme::Mode::Light
                                        : (s.themeMode == Settings::ThemeMode::Dark
@@ -1320,7 +1366,7 @@ QWidget *MainWindow::buildSettingsPage()
             Settings s = m_store->load();
             s.startWithWindows = on;
             QString error;
-            m_store->save(s, &error);
+            persistSettings(s, QStringLiteral("your settings"));
 
             // The setting and the mechanism are changed together. They are the same fact
             // stored twice - the file records the intent, and a scheduled task or the Run key
@@ -1377,8 +1423,7 @@ QWidget *MainWindow::buildSettingsPage()
                         return;
                     Settings s = m_store->load();
                     s.closeToTray = m_closeCombo->currentData().toInt() != 0;
-                    QString error;
-                    m_store->save(s, &error);
+                    persistSettings(s, QStringLiteral("the theme"));
                     refreshStartupNote();
                 });
         closeRow->addWidget(m_closeCombo);
@@ -1417,7 +1462,7 @@ QWidget *MainWindow::buildSettingsPage()
             Settings s = m_store->load();
             s.checkForUpdates = on;
             QString error;
-            m_store->save(s, &error);
+            persistSettings(s, QStringLiteral("your settings"));
         });
         updateRow->addWidget(m_updateCheck);
         cl->addLayout(updateRow);
@@ -1519,11 +1564,15 @@ QWidget *MainWindow::buildSettingsPage()
             m_diagnosticsPanel->setMonitorError(m_appMonitor->errorString());
             m_diagnosticsPanel->setMonitorRunning(m_appMonitor->isRunning());
             m_diagnosticsPanel->setMonitorTelemetry(m_appMonitor->eventsSeenTotal(),
-                                                    m_appMonitor->eventsDecodedTotal());
+                                                    m_appMonitor->eventsDecodedTotal(),
+                                                    m_appMonitor->udpEventsTotal(),
+                                                    m_appMonitor->runningSeconds());
             m_diagnosticsPanel->setEventLayout(m_appMonitor->etwEventLayout());
             m_diagnosticsPanel->setAddressMiss(m_appMonitor->addressMissReport());
             m_diagnosticsPanel->setRawEvents(m_appMonitor->rawEventReport());
             m_diagnosticsPanel->setRawBits(m_appMonitor->rawBitsReport());
+            m_diagnosticsPanel->setEventIds(m_appMonitor->eventIdReport());
+            m_diagnosticsPanel->setConsumerState(m_appMonitor->consumerReport());
             if (m_diagnosticsPanel->isVisible())
                 m_diagnosticsPanel->refresh();
         };
@@ -2062,6 +2111,30 @@ void MainWindow::buildTray()
     // settings page so a check can also be started at launch.
     m_updater = new Updater(this);
 
+    // Connected once, not per check: a second check used to stack another pair of
+    // handlers, so a deferral restarted the snooze timer several times.
+    connect(m_updater, &Updater::updateSkipped, this, [this](const QString &version) {
+        Settings s = m_store->load();
+        s.skippedVersion = version;
+        persistSettings(s, QStringLiteral("your settings"));
+        setUpdateStatus(QStringLiteral("Version %1 skipped. A newer version will be offered.")
+                            .arg(version),
+                        false);
+    });
+    connect(m_updater, &Updater::updateDeferred, this, [this](const QString &version) {
+        setUpdateStatus(QStringLiteral("Update %1 postponed. It will be offered again.")
+                            .arg(version),
+                        false);
+
+        if (!m_updateSnooze) {
+            m_updateSnooze = new QTimer(this);
+            m_updateSnooze->setSingleShot(true);
+            m_updateSnooze->setInterval(kUpdateSnoozeMs);
+            connect(m_updateSnooze, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
+        }
+        m_updateSnooze->start();
+    });
+
     m_tray = new QSystemTrayIcon(this);
     updateTrayIcon(false);
 
@@ -2085,7 +2158,12 @@ void MainWindow::buildTray()
     menu->addSeparator();
 
     auto *quitAction = new QAction(QStringLiteral("Quit"), this);
-    connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+    connect(quitAction, &QAction::triggered, this, [this] {
+        // Hide before the destructors run their synchronous teardown, or the window stays
+        // visible and frozen for as long as that takes.
+        hide();
+        QApplication::quit();
+    });
     menu->addAction(quitAction);
 
     m_tray->setContextMenu(menu);
@@ -2870,7 +2948,17 @@ void MainWindow::refreshStatistics()
 
     // The per-application table, busiest first over the whole cycle.
     if (m_appUsageTable) {
-        const QVector<UsageTracker::AppUsage> apps = m_usage->appUsageOverDays(30);
+        // The window is the CYCLE, not a fixed 30 days.
+        //
+        // The panel's own caption says "over the current cycle", and the remainder row below is
+        // computed against the cycle totals - so asking for a 30-day window made the two disagree
+        // whenever the cycle is not exactly 30 days: a shorter cycle included days from before it
+        // (row totals too large, remainder clamped to zero, real gap hidden), a longer one silently
+        // dropped days. Both windows are the cycle now.
+        const int cycleDays = qMax(1, UsageTracker::cycleStartDate(settings.usage)
+                                          .daysTo(QDate::currentDate())
+                                      + 1);
+        const QVector<UsageTracker::AppUsage> apps = m_usage->appUsageOverDays(cycleDays);
         // The toggle only makes sense when there is something hidden behind it.
         if (m_appUsageMore) {
             m_appUsageMore->setVisible(apps.size() > 10);
@@ -2879,7 +2967,30 @@ void MainWindow::refreshStatistics()
                                         : QStringLiteral("View All (%1)").arg(apps.size()));
         }
         const int shown = qMin(apps.size(), m_appUsageShowAll ? apps.size() : 10);
-        m_appUsageTable->setRowCount(shown);
+
+        // What is left over, shown instead of silently missing.
+        //
+        // Measured on a real machine: the machine total for the day was 9,848 MB while the
+        // attributed rows summed to 4,136 MB - 58% absent, and a user comparing against qBittorrent's
+        // own "600 MB downloaded" read 182 MB and reasonably called the table wrong. The causes are
+        // mundane (system processes carry no application, and for a while the monitor only ran while
+        // the panel was open), but a table that simply omits them looks like a broken counter.
+        //
+        // The remainder is therefore its own row, labelled for what it is.
+        quint64 attributedDown = 0;
+        quint64 attributedUp = 0;
+        for (const UsageTracker::AppUsage &a : apps) {
+            attributedDown += a.down;
+            attributedUp += a.up;
+        }
+        const quint64 cycleDown = m_usage->cycleDownBytes();
+        const quint64 cycleUp = m_usage->cycleUpBytes();
+        const quint64 restDown = cycleDown > attributedDown ? cycleDown - attributedDown : 0;
+        const quint64 restUp = cycleUp > attributedUp ? cycleUp - attributedUp : 0;
+        const quint64 rest = restDown + restUp;
+        const bool hasRemainder = rest > (1u << 20);   // more than a megabyte is worth a row
+
+        m_appUsageTable->setRowCount(shown + (hasRemainder ? 1 : 0));
         for (int row = 0; row < shown; ++row) {
             const UsageTracker::AppUsage &a = apps.at(row);
             const QString label = a.name.isEmpty() ? QFileInfo(a.path).fileName() : a.name;
@@ -2896,14 +3007,34 @@ void MainWindow::refreshStatistics()
             m_appUsageTable->setItem(row, 3, new QTableWidgetItem(
                                                 formatBytes(double(a.up))));
         }
+        const int totalRows = shown + (hasRemainder ? 1 : 0);
+        if (hasRemainder) {
+            const int row = shown;
+            auto *nameItem = new QTableWidgetItem(QStringLiteral("System and unattributed"));
+            nameItem->setToolTip(
+                QStringLiteral("Traffic the machine measured but could not put under an application: "
+                               "system services (svchost, DNS, Windows Update), and any time when "
+                               "monitoring was not running. It is not an error - it is the gap "
+                               "between the machine total and the rows above."));
+            nameItem->setForeground(QBrush(theme::kTextMuted()));
+            m_appUsageTable->setItem(row, 0, nameItem);
+
+            const quint64 values[3] = {rest, restDown, restUp};
+            for (int c = 1; c < 4; ++c) {
+                auto *item = new QTableWidgetItem(formatBytes(double(values[c - 1])));
+                item->setForeground(QBrush(theme::kTextMuted()));
+                m_appUsageTable->setItem(row, c, item);
+            }
+        }
+
         for (int c = 1; c < 4; ++c) {
-            for (int r = 0; r < shown; ++r) {
+            for (int r = 0; r < totalRows; ++r) {
                 if (QTableWidgetItem *it = m_appUsageTable->item(r, c))
                     it->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
             }
         }
-        m_appUsageEmpty->setVisible(shown == 0);
-        m_appUsageTable->setVisible(shown > 0);
+        m_appUsageEmpty->setVisible(totalRows == 0);
+        m_appUsageTable->setVisible(totalRows > 0);
         if (m_appUsageHint) {
             m_appUsageHint->setText(
                 shown == 0
@@ -3246,8 +3377,10 @@ void MainWindow::onResetCycle()
     Settings settings = m_store->load();
     settings.usage.cycleStart = QDate::currentDate();
 
-    QString error;
-    m_store->save(settings, &error);
+    // If this save fails the cycle start is not remembered and the next launch begins a cycle
+    // again - the reset appears to have worked and then did not, so the failure is reported.
+    if (!persistSettings(settings, QStringLiteral("the billing cycle")))
+        return;
 
     m_usage->resetCurrentCycle(settings.usage);
     refreshUsage();
@@ -3362,8 +3495,7 @@ void MainWindow::onThemeModeChanged()
     Settings settings = m_store->load();
     settings.themeMode = Settings::ThemeMode(m_themeCombo->currentData().toInt());
 
-    QString error;
-    m_store->save(settings, &error);
+    persistSettings(settings, QStringLiteral("the theme"));
 
     theme::setMode(settings.themeMode == Settings::ThemeMode::Light
                        ? theme::Mode::Light
@@ -3646,7 +3778,7 @@ void MainWindow::resetEverything()
     // Write the defaults back, so the application is running what it will read next launch.
     // The file was removed above; this creates it fresh rather than leaving nothing behind.
     const Settings defaults;
-    m_store->save(defaults, &ignored);
+    persistSettings(defaults, QStringLiteral("your settings"));
 
     // Apply the defaults to the running application rather than waiting for a restart.
     //
@@ -3673,14 +3805,53 @@ void MainWindow::resetEverything()
                              5000);
 }
 
+bool MainWindow::persistSettings(const Settings &s, const QString &what)
+{
+    QString error;
+    if (!m_store->save(s, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("Could not save %1: %2").arg(what, error), 8000);
+        qWarning("Flowbit: could not save %s: %s", qPrintable(what), qPrintable(error));
+        return false;
+    }
+    return true;
+}
+
 void MainWindow::applyStartupSetting()
 {
     if (!m_startupCheck)
         return;
 
     const Settings s = m_store->load();
-    QString error;
-    const bool ok = autostart::setEnabled(s.startWithWindows, &error);
+
+    // The registration itself runs on a worker thread.
+    //
+    // setEnabled() shells out to schtasks.exe and waits up to twenty seconds for it. On the GUI
+    // thread that is a twenty-second freeze for a checkbox - and Qt's own QProcess documentation
+    // is explicit that waitForFinished() blocks the calling thread. This mirrors what
+    // AppMonitor::startAsync() already does for its own slow, external work.
+    if (m_startupApplying) {
+        m_startupPending = true;
+        return;
+    }
+    m_startupApplying = true;
+    m_startupPending = false;
+
+    const bool want = s.startWithWindows;
+    QThread *worker = QThread::create([this, want] {
+        QString error;
+        const bool ok = autostart::setEnabled(want, &error);
+        QMetaObject::invokeMethod(
+            this, [this, ok, error] { onStartupSettingApplied(ok, error); },
+            Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QThread::deleteLater);
+    worker->start();
+}
+
+void MainWindow::onStartupSettingApplied(bool ok, const QString &error)
+{
+    m_startupApplying = false;
 
     // A task usually creates fine; when policy or permissions forbid one, setEnabled falls back
     // to the Run key and reports that with this marker. The fallback still starts Flowbit, so
@@ -3713,6 +3884,12 @@ void MainWindow::applyStartupSetting()
     }
 
     refreshStartupNote();
+
+    // Replay a request that arrived while this one was running.
+    if (m_startupPending) {
+        m_startupPending = false;
+        applyStartupSetting();
+    }
 }
 
 void MainWindow::refreshStartupNote()
@@ -3818,6 +3995,9 @@ void MainWindow::setUpdateStatus(const QString &text, bool isError)
         m_updateStatus->style()->polish(m_updateStatus);
     }
     m_updateStatus->setText(text);
+    // The label is hidden at construction; without this every result stayed
+    // invisible, including the one the user asked for.
+    m_updateStatus->setVisible(!text.isEmpty());
 }
 
 void MainWindow::checkForUpdatesNow(bool announce)
@@ -3847,6 +4027,20 @@ void MainWindow::checkForUpdatesNow(bool announce)
             [this, once, restore](const QString &version, const QString &url,
                                   const QString &notes) {
                 restore();
+
+                // A version the user skipped is not offered again. The setting existed and was
+                // saved, but nothing ever read it, so "skip" could not work - the same version
+                // came back on every launch with no way to stop it.
+                const Settings current = m_store->load();
+                if (!current.skippedVersion.isEmpty() && current.skippedVersion == version) {
+                    setUpdateStatus(
+                        QStringLiteral("Version %1 skipped. A newer version will be offered.")
+                            .arg(version),
+                        false);
+                    once->deleteLater();
+                    return;
+                }
+
                 setUpdateStatus(QStringLiteral("Version %1 is available.").arg(version), false);
                 m_updater->offerUpdate(version, url, notes);
                 once->deleteLater();
@@ -3985,10 +4179,16 @@ void MainWindow::closeEvent(QCloseEvent *event)
     // Hide to the tray and keep running, which is what Flowbit has always done.
     QMainWindow::closeEvent(event);
     if (settings.closeToTray && m_tray && m_tray->isVisible()) {
-        // Say where the window went, once, so hiding is not mistaken for nothing happening.
-        static bool toldOnce = false;
-        if (!toldOnce) {
-            toldOnce = true;
+        // Say where the window went, ONCE - and once means once, not once per launch.
+        //
+        // This was a function-local static, so it reset with the process: a user who closes the
+        // window daily saw the same notification daily. The flag is stored now, so the hint
+        // appears on the first close after installation and never again.
+        Settings hintSettings = m_store->load();
+        if (!hintSettings.trayHintShown) {
+            hintSettings.trayHintShown = true;
+            QString hintError;
+            persistSettings(hintSettings, QStringLiteral("your hintSettings"));
             m_tray->showMessage(
                 QStringLiteral("Flowbit"),
                 QStringLiteral("Flowbit keeps running in the notification area so "

@@ -58,6 +58,41 @@ QString UsageTracker::fileForApps(const QDate &month) const
         .arg(m_dir, month.toString(QStringLiteral("yyyy-MM")));
 }
 
+void UsageTracker::pruneOldMonths()
+{
+    // One file per month, written forever and never removed: the directory grew without limit for
+    // the life of the installation, holding per-application histories nobody can reach from the UI
+    // (the pages read the current cycle and the last 30 days).
+    //
+    // Twelve months is kept because that is the widest window any view can ask for, and a year is
+    // the obvious boundary for "how much did I use" questions. The current month is always kept.
+    constexpr int kKeepMonths = 13;
+
+    QDir dir(m_dir);
+    if (!dir.exists())
+        return;
+
+    const QDate oldest = QDate::currentDate().addMonths(-(kKeepMonths - 1));
+    const QStringList files = dir.entryList({QStringLiteral("apps-*.json"),
+                                             QStringLiteral("usage-*.json")},
+                                            QDir::Files);
+    for (const QString &name : files) {
+        // Both kinds are named <prefix>-yyyy-MM.json. Splitting on the LAST dash yields "04.json",
+        // because the month itself contains one - which made this prune skip every file, so the
+        // retention never actually deleted anything. Take the seven characters after the first
+        // dash instead.
+        const int dash = name.indexOf(QLatin1Char('-'));
+        if (dash < 0 || name.size() < dash + 8)
+            continue;
+        const QString monthText = name.mid(dash + 1, 7);
+        const QDate month = QDate::fromString(monthText, QStringLiteral("yyyy-MM"));
+        if (!month.isValid() || month >= oldest)
+            continue;
+        if (QFile::remove(dir.filePath(name)))
+            qInfo("Flowbit: removed old usage history %s", qPrintable(name));
+    }
+}
+
 void UsageTracker::loadAppsMonth(const QDate &month)
 {
     QFile file(fileForApps(month));
@@ -98,16 +133,32 @@ void UsageTracker::loadAppsMonth(const QDate &month)
             AppUsage u;
             u.path = path;
             u.name = o.value(QStringLiteral("name")).toString();
-            u.down = quint64(o.value(QStringLiteral("down")).toDouble());
-            u.up = quint64(o.value(QStringLiteral("up")).toDouble());
+            // Sanity filter on load, because a corrupted value that is already on disk would
+            // otherwise be displayed forever: the accumulation bug charged a whole cumulative
+            // total every second, which produced entries near 2^64 (one reached 8.6e18 bytes on a
+            // real machine). A single day cannot hold a petabyte for one application on any
+            // consumer machine, so anything at or above that is discarded rather than shown.
+            constexpr double kMaxPlausibleDay = 1.0e15;   // 1 PB
+            const double storedDown = o.value(QStringLiteral("down")).toDouble();
+            const double storedUp = o.value(QStringLiteral("up")).toDouble();
+            if (storedDown < 0 || storedUp < 0
+                || storedDown >= kMaxPlausibleDay || storedUp >= kMaxPlausibleDay)
+                continue;
+
+            u.down = quint64(storedDown);
+            u.up = quint64(storedUp);
             bucket.insert(path, u);
         }
     }
 }
 
-void UsageTracker::storeAppsMonth(const QDate &month)
+bool UsageTracker::storeAppsMonth(const QDate &month)
 {
-    QDir().mkpath(m_dir);
+    // A directory that cannot be created means every later save fails, and usage history is the one
+    // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
+    if (!QDir().mkpath(m_dir))
+        qWarning("Flowbit: could not create the history directory %s - usage will not be saved",
+                 qPrintable(m_dir));
 
     const QString prefix = month.toString(QStringLiteral("yyyy-MM"));
     QJsonArray days;
@@ -144,11 +195,14 @@ void UsageTracker::storeAppsMonth(const QDate &month)
     QSaveFile file(fileForApps(month));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning("Flowbit: could not write per-app usage %s", qPrintable(file.fileName()));
-        return;
+        return false;
     }
     file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
-    if (!file.commit())
+    if (!file.commit()) {
         qWarning("Flowbit: could not commit per-app usage %s", qPrintable(file.fileName()));
+        return false;
+    }
+    return true;
 }
 
 void UsageTracker::addAppSample(const QString &path, const QString &name,
@@ -157,15 +211,13 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
     if (path.isEmpty() || (downBytes == 0 && upBytes == 0))
         return;
 
-    // Roll the date if the app has been running past midnight, so a sample cannot
-    // be charged to the previous day.
-    const QDate today = QDate::currentDate();
-    if (today != m_today) {
-        flush();
-        m_today = today;
-        m_liveDown = 0;
-        m_liveUp = 0;
-    }
+    rollOverDay();
+
+    // A single interval cannot legitimately exceed this. Anything larger is a
+    // driver-level counter jump, and admitting it corrupts the stored history.
+    constexpr quint64 kMaxSampleBytes = 64ull * 1024ull * 1024ull * 1024ull;   // 64 GiB
+    if (downBytes > kMaxSampleBytes || upBytes > kMaxSampleBytes)
+        return;
 
     const QString key = m_today.toString(Qt::ISODate);
     AppUsage &u = m_appDays[key][path];
@@ -173,6 +225,10 @@ void UsageTracker::addAppSample(const QString &path, const QString &name,
         u.path = path;
     if (!name.isEmpty())
         u.name = name;      // refresh the display name as it is seen
+
+    // The caller passes the bytes measured during this interval, not a lifetime
+    // counter. Adding them is the whole contract; differencing them here charged
+    // steady traffic as zero and rising traffic as only its increase.
     u.down += downBytes;
     u.up += upBytes;
     m_appDaysDirty.insert(key.left(7));   // yyyy-MM
@@ -269,6 +325,8 @@ void UsageTracker::load(const UsageConfig &config)
     const QDate start = cycleStartDate(config);
     const QDate end = cycleEndDate(config);
 
+    pruneOldMonths();
+
     const QDate appFrom = qMin(start, QDate::currentDate().addDays(-6));
     QDate cursor(appFrom.year(), appFrom.month(), 1);
     const QDate lastMonth(end.year(), end.month(), 1);
@@ -324,9 +382,13 @@ void UsageTracker::loadMonth(const QDate &month)
     }
 }
 
-void UsageTracker::storeMonth(const QDate &month)
+bool UsageTracker::storeMonth(const QDate &month)
 {
-    QDir().mkpath(m_dir);
+    // A directory that cannot be created means every later save fails, and usage history is the one
+    // thing that cannot be reconstructed from anywhere else. Say so once rather than failing mute.
+    if (!QDir().mkpath(m_dir))
+        qWarning("Flowbit: could not create the history directory %s - usage will not be saved",
+                 qPrintable(m_dir));
 
     QJsonArray days;
     const QString prefix = month.toString(QStringLiteral("yyyy-MM"));
@@ -351,25 +413,36 @@ void UsageTracker::storeMonth(const QDate &month)
     QSaveFile file(fileForMonth(month));
     if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         qWarning("Flowbit: cannot write usage file %s", qPrintable(file.fileName()));
-        return;
+        return false;
     }
     file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
-    if (!file.commit())
+    if (!file.commit()) {
         qWarning("Flowbit: failed to commit usage file %s", qPrintable(file.fileName()));
+        return false;
+    }
+    return true;
+}
+
+void UsageTracker::rollOverDay()
+{
+    const QDate now = QDate::currentDate();
+    if (now == m_today)
+        return;
+
+    // Bank the previous day before attributing anything to the new one. The live
+    // counters are cycle totals, not day totals, so they are deliberately kept.
+    flush();
+    m_today = now;
 }
 
 void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
 {
+    // Before the zero check: an idle machine still has to cross midnight, or the
+    // first sample tomorrow is charged to yesterday.
+    rollOverDay();
+
     if (downBytes == 0 && upBytes == 0)
         return;
-
-    const QDate now = QDate::currentDate();
-    if (now != m_today) {
-        // Midnight rollover: bank the previous day before attributing anything
-        // to the new one.
-        flush();
-        m_today = now;
-    }
 
     m_liveDown += downBytes;
     m_liveUp += upBytes;
@@ -387,23 +460,38 @@ void UsageTracker::addSample(quint64 downBytes, quint64 upBytes)
     emit usageChanged();
 }
 
-void UsageTracker::flush()
+int UsageTracker::flush()
 {
-    for (const QString &monthKey : std::as_const(m_dirtyMonths)) {
+    // A month is only forgotten once it has actually been written.
+    //
+    // The old code cleared both dirty sets unconditionally after attempting the writes, so a
+    // failed write (full disk, a file held open, a permissions problem) dropped the month from the
+    // queue forever: the history was not just unsaved, it was never retried, and the 30-day view
+    // came back short with no way to know why. Failures now stay queued and the count is returned
+    // so a caller can say something.
+    int failed = 0;
+
+    const QSet<QString> months = m_dirtyMonths;
+    for (const QString &monthKey : months) {
         const QDate month = QDate::fromString(monthKey + QStringLiteral("-01"), Qt::ISODate);
-        if (month.isValid())
-            storeMonth(month);
+        if (!month.isValid() || storeMonth(month))
+            m_dirtyMonths.remove(monthKey);
+        else
+            ++failed;
     }
-    m_dirtyMonths.clear();
 
     // The per-app history is written from the same call and the same timer, so a
     // single flush leaves both files consistent with each other.
-    for (const QString &monthKey : std::as_const(m_appDaysDirty)) {
+    const QSet<QString> appMonths = m_appDaysDirty;
+    for (const QString &monthKey : appMonths) {
         const QDate month = QDate::fromString(monthKey + QStringLiteral("-01"), Qt::ISODate);
-        if (month.isValid())
-            storeAppsMonth(month);
+        if (!month.isValid() || storeAppsMonth(month))
+            m_appDaysDirty.remove(monthKey);
+        else
+            ++failed;
     }
-    m_appDaysDirty.clear();
+
+    return failed;
 }
 
 quint64 UsageTracker::cycleDownBytes() const
@@ -482,17 +570,47 @@ void UsageTracker::resetCurrentCycle(const UsageConfig &config)
     // Clear only the days inside the active cycle - older history stays intact.
     for (QDate d = start; d <= today; d = d.addDays(1)) {
         const QString k = keyFor(d);
+        const QString month = d.toString(QStringLiteral("yyyy-MM"));
         if (m_days.contains(k)) {
             m_days[k].down = 0;
             m_days[k].up = 0;
-            m_dirtyMonths.insert(d.toString(QStringLiteral("yyyy-MM")));
+            m_dirtyMonths.insert(month);
         }
+        // The per-application table is the same cycle, so leaving it behind made
+        // the reset look partial and inflated the table's share of the new total.
+        if (m_appDays.remove(k) > 0)
+            m_appDaysDirty.insert(month);
     }
 
     m_liveDown = m_liveUp = 0;
     flush();
 
     emit usageChanged();
+}
+
+int UsageTracker::resetAllUsage()
+{
+    m_days.clear();
+    m_appDays.clear();
+    m_dirtyMonths.clear();
+    m_appDaysDirty.clear();
+    m_liveDown = m_liveUp = 0;
+    m_today = QDate::currentDate();
+
+    // Delete the persisted months too; clearing memory alone would restore the
+    // old figures on the next launch.
+    int failed = 0;
+    QDir dir(m_dir);
+    const QStringList files =
+        dir.entryList({QStringLiteral("usage-*.json"), QStringLiteral("apps-*.json")},
+                      QDir::Files);
+    for (const QString &name : files) {
+        if (!dir.remove(name))
+            ++failed;
+    }
+
+    emit usageChanged();
+    return failed;
 }
 
 } // namespace net

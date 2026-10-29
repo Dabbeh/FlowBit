@@ -67,6 +67,24 @@ public:
     // registry write that did not happen would be heavier than the failure deserves.
     void applyStartupSetting();
 
+    // Completion handler for the off-thread startup-task change.
+    void onStartupSettingApplied(bool ok, const QString &error);
+
+    // Saves settings and reports a failure where the user can see it.
+    //
+    // Several call sites discarded the result, so a full disk or a permissions problem made a
+    // setting look applied while it silently reverted at the next launch. `what` names the thing
+    // that could not be saved ("the theme", "your schedule") so the message says something.
+    bool persistSettings(const Settings &s, const QString &what);
+
+    // True while a schtasks call is in flight. schtasks can take seconds; waiting for it on the
+    // GUI thread froze the window for up to the 20s timeout, which is why it now runs elsewhere.
+    bool m_startupApplying = false;
+
+    // A request that arrived while one was running, replayed afterwards so a rapid toggle cannot
+    // be silently dropped.
+    bool m_startupPending = false;
+
     // Runs the update check and reports the outcome. `announce` is false for the silent
     // check at startup, where "up to date" is not worth a window, and true when the user
     // pressed the button and is owed an answer either way.
@@ -354,6 +372,13 @@ private:
     //
     // Bounded. If the state does not clear it will not clear by waiting, and an unbounded poll
     // would be a background loop doing nothing for the life of the session.
+    // Re-offers a postponed update later in the same session. One timer, restarted on each
+    // deferral, so repeated "Later" clicks cannot queue several prompts.
+    QTimer *m_updateSnooze = nullptr;
+
+    // How long a postponed update waits before it is mentioned again.
+    static constexpr int kUpdateSnoozeMs = 30 * 60 * 1000;
+
     QTimer *m_driverRetry = nullptr;
     int m_driverAttempts = 0;
 

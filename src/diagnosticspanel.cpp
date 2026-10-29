@@ -176,10 +176,23 @@ void DiagnosticsPanel::setMonitorError(const QString &error)
     m_monitorError = error;
 }
 
-void DiagnosticsPanel::setMonitorTelemetry(quint64 seen, quint64 decoded)
+void DiagnosticsPanel::setMonitorTelemetry(quint64 seen, quint64 decoded, quint64 udp,
+                                          int monitorSeconds)
 {
     m_seen = seen;
     m_decoded = decoded;
+    m_udp = udp;
+    m_monitorSeconds = monitorSeconds;
+}
+
+void DiagnosticsPanel::setConsumerState(const QString &state)
+{
+    m_consumerState = state;
+}
+
+void DiagnosticsPanel::setEventIds(const QString &ids)
+{
+    m_eventIds = ids;
 }
 
 void DiagnosticsPanel::setMonitorRunning(bool running)
@@ -209,9 +222,9 @@ void DiagnosticsPanel::setRawBits(const QString &text)
 
 void DiagnosticsPanel::refresh()
 {
-    m_report = collectDiagnostics(processIsElevated(), m_monitorError, m_seen, m_decoded,
-                                  m_monitorRunning, m_eventLayout, m_addressMiss, m_rawEvents,
-                                  m_rawBits);
+    m_report = collectDiagnostics(processIsElevated(), m_monitorError, m_seen, m_decoded, m_udp,
+                                  m_monitorRunning, m_monitorSeconds, m_eventLayout, m_addressMiss,
+                                  m_rawEvents, m_rawBits, m_eventIds, m_consumerState);
     buildRows();
 }
 

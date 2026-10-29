@@ -157,6 +157,10 @@ public:
     quint64 pacedPacketsDown() const { return m_pacedDown.load(); }
     quint64 pacedPacketsUp() const { return m_pacedUp.load(); }
 
+    // Packets lost because re-injection failed even after the retry budget. Reported in
+    // diagnostics so "it drops my connection" can be answered with a number.
+    quint64 injectionFailures() const { return m_injectFailures.load(); }
+
     // Token buckets for one rule, one per direction. Declared here because the
     // worker lambdas in the .cpp name the type; not part of the public API.
     struct Buckets;
@@ -208,6 +212,14 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<quint64> m_pacedDown{0};
     std::atomic<quint64> m_pacedUp{0};
+
+    // Packets whose re-injection failed and were therefore LOST.
+    //
+    // WinDivertSend is the second half of a recv/send pair: a failed send means that packet never
+    // reaches the stack. The shapes of failure differ - the injection queue fills while the driver
+    // is busy - so this is counted and retried briefly rather than dropped in silence, which is
+    // what a shaped connection "randomly stalling" is made of.
+    std::atomic<quint64> m_injectFailures{0};
 };
 
 } // namespace net

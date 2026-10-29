@@ -6,6 +6,7 @@
 #include <QString>
 
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <thread>
 
@@ -28,6 +29,7 @@ public:
 
     void setRate(qint64 rateBps)
     {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (rateBps == m_rate)
             return;
         m_rate = rateBps;
@@ -37,54 +39,73 @@ public:
             m_tokens = 0;
     }
 
-    qint64 rate() const { return m_rate; }
+    qint64 rate() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_rate;
+    }
 
     // Blocks until the packet may be released. Returns false if `stopFlag` was
     // raised while waiting (the caller should still forward the packet).
     bool waitFor(size_t packetLen, const std::atomic<bool> &stopFlag,
                  qint64 *currentRate = nullptr)
     {
-        if (m_rate <= 0) {
-            if (currentRate)
-                *currentRate = m_rate;
-            return true;
-        }
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_rate <= 0) {
+                if (currentRate)
+                    *currentRate = m_rate;
+                return true;
+            }
 
-        if (m_last.time_since_epoch().count() == 0)
-            m_last = Clock::now();
+            if (m_last.time_since_epoch().count() == 0)
+                m_last = Clock::now();
 
-        refill();
+            refillLocked();
 
-        if (static_cast<qint64>(packetLen) <= m_tokens) {
-            m_tokens -= static_cast<qint64>(packetLen);
-            if (currentRate)
-                *currentRate = m_rate;
-            return true;
+            if (static_cast<qint64>(packetLen) <= m_tokens) {
+                m_tokens -= static_cast<qint64>(packetLen);
+                if (currentRate)
+                    *currentRate = m_rate;
+                return true;
+            }
         }
 
         // Not enough credit: wait only as long as the current deficit requires.
         // The loop re-checks the live rate every slice so a change takes effect
         // immediately instead of after the whole (possibly seconds-long) wait.
-        while (!stopFlag.load(std::memory_order_relaxed)) {
-            if (m_rate <= 0) {
-                // Became unlimited mid-wait: release immediately.
-                if (currentRate)
-                    *currentRate = 0;
-                return true;
-            }
-            if (static_cast<qint64>(packetLen) <= m_tokens)
+        qint64 waitMs = kSleepSliceMs;
+        for (;;) {
+            if (stopFlag.load(std::memory_order_relaxed))
                 break;
 
-            const qint64 deficit = static_cast<qint64>(packetLen) - m_tokens;
-            qint64 waitMs = (deficit * 1000) / m_rate;
-            if (waitMs < kSleepSliceMs)
-                waitMs = kSleepSliceMs;
-            waitMs = std::min<qint64>(waitMs, kMaxSleepSliceMs);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
 
+                if (m_rate <= 0) {
+                    // Became unlimited mid-wait: release immediately.
+                    if (currentRate)
+                        *currentRate = 0;
+                    return true;
+                }
+                if (static_cast<qint64>(packetLen) <= m_tokens)
+                    break;
+
+                const qint64 deficit = static_cast<qint64>(packetLen) - m_tokens;
+                waitMs = (deficit * 1000) / m_rate;
+                if (waitMs < kSleepSliceMs)
+                    waitMs = kSleepSliceMs;
+                waitMs = std::min<qint64>(waitMs, kMaxSleepSliceMs);
+            }
+
+            // Slept without the lock: a rate change must not have to wait for a pacing slice.
             std::this_thread::sleep_for(std::chrono::milliseconds(waitMs));
-            refill();
+
+            std::lock_guard<std::mutex> lock(m_mutex);
+            refillLocked();
         }
 
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (static_cast<qint64>(packetLen) <= m_tokens)
             m_tokens -= static_cast<qint64>(packetLen);
         else
@@ -98,7 +119,8 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
 
-    void refill()
+    // Callers hold m_mutex.
+    void refillLocked()
     {
         const auto now = Clock::now();
         if (m_rate > 0 && m_last.time_since_epoch().count() != 0) {
@@ -111,6 +133,12 @@ private:
         m_last = now;
     }
 
+    // Guarded, because the rate is changed from the GUI thread while a packet worker sits in
+    // waitFor(). These were plain qint64: setRate() wrote m_rate/m_burst/m_tokens while the worker
+    // read and updated the same fields, which is a data race - undefined behaviour, not merely an
+    // occasional stale read. The mutex is never held across the sleep below, so pacing is not
+    // serialised with the rate change, only with its own bookkeeping.
+    mutable std::mutex m_mutex;
     qint64 m_rate = 0;
     qint64 m_burst = kMinBurstBytes;
     qint64 m_tokens = 0;

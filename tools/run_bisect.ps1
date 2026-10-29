@@ -47,6 +47,7 @@ $sources = @(
     "$root\src\appactivitypanel.cpp",
     "$root\src\appnames.cpp",
     "$root\src\appmonitor.cpp",
+    "$root\src\etwclass.cpp",
     "$root\src\diagnosticspanel.cpp",
     "$root\src\diagnostics.cpp",
     "$root\src\appruledialog.cpp",

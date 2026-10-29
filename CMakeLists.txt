@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 
 project(Flowbit
-    VERSION 1.0.1
+    VERSION 1.0.2
     DESCRIPTION "System-wide and per-application bandwidth limiter with schedules, live monitoring and diagnostics"
     LANGUAGES CXX RC)
 
@@ -133,6 +133,28 @@ add_executable(Flowbit WIN32
     src/diagnostics.cpp
     src/diagnosticspanel.h
     src/diagnosticspanel.cpp
+    src/theme.h
+    src/theme.cpp
+    src/checkmark.h
+    src/checkmark.cpp
+    src/busydots.h
+    src/busydots.cpp
+    src/crossticon.h
+    src/crossticon.cpp
+    src/navicons.h
+    src/navicons.cpp
+    src/navbutton.h
+    src/navbutton.cpp
+    src/scrollbaranimator.h
+    src/scrollbaranimator.cpp
+    src/autostart.h
+    src/autostart.cpp
+    src/etwclass.h
+    src/etwclass.cpp
+    src/selftest.h
+    src/selftest.cpp
+    src/updater.h
+    src/updater.cpp
     src/app.rc
 )
 

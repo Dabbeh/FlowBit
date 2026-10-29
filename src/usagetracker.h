@@ -40,7 +40,9 @@ public:
     void addSample(quint64 downBytes, quint64 upBytes);
 
     // Forces a write; called periodically and on shutdown.
-    void flush();
+    // Returns the number of months that could not be written; those stay queued and are
+    // retried on the next flush instead of being forgotten.
+    int flush();
 
     // True when there are unflushed changes.
     bool hasPendingWrites() const { return !m_dirtyMonths.isEmpty(); }
@@ -49,6 +51,11 @@ public:
     quint64 cycleTotalBytes() const;
     quint64 cycleDownBytes() const;
     quint64 cycleUpBytes() const;
+
+    // Where the current cycle began. Public because callers that need to project usage ("at this
+    // rate, N GB by <date>") need the same answer the tracker uses for its own totals - deriving
+    // it separately is how two parts of one screen end up disagreeing.
+    static QDate cycleStartDate(const UsageConfig &config);
 
     // One entry per day in the cycle that has recorded usage.
     struct DayUsage {
@@ -80,7 +87,7 @@ public:
         QVector<AppUsage> apps;
     };
 
-    // Records one interval's bytes for an application. Called once per sampled
+    // Records one interval's bytes for an application. Called once per completed
     // interval per application, so it must stay cheap: it only adds to maps.
     void addAppSample(const QString &path, const QString &name,
                       quint64 downBytes, quint64 upBytes);
@@ -99,20 +106,30 @@ public:
     // Clears usage for the current cycle only.
     void resetCurrentCycle(const UsageConfig &config);
 
+    // Deletes every recorded usage and per-application entry, in memory and on
+    // disk. Returns the number of files that could not be removed.
+    int resetAllUsage();
+
 signals:
     // Emitted after totals change, so the UI can repaint without polling.
     void usageChanged();
 
 private:
-    static QDate cycleStartDate(const UsageConfig &config);
     static QDate cycleEndDate(const UsageConfig &config);
     QString fileForMonth(const QDate &month) const;
     void loadMonth(const QDate &month);
-    void storeMonth(const QDate &month);
+    bool storeMonth(const QDate &month);
+
+    // Banks the previous day and points the tracker at the new one. Called
+    // before either add path, so a zero-byte sample at midnight still rolls.
+    void rollOverDay();
 
     // Per-app history, stored in its own file per month.
     void loadAppsMonth(const QDate &month);
-    void storeAppsMonth(const QDate &month);
+
+    // Deletes month files that no view can reach any more (see the implementation).
+    void pruneOldMonths();
+    bool storeAppsMonth(const QDate &month);
     QString fileForApps(const QDate &month) const;
     
     QString m_dir;

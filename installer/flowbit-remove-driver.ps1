@@ -55,13 +55,19 @@ if ($state -ne 'STOPPED') {
     }
 }
 
-if ($state -eq 'STOPPED') {
-    # The driver is unloaded, so the deletion can complete now rather than at the next boot.
-    & sc.exe delete $name | Out-Null
+if ($state -eq 'STOPPED' -or $state -eq 'ABSENT') {
+    # The service is NOT deleted, and that is the fix.
+    #
+    # Deleting it is what set DeleteFlag on machines in the field. Windows only completes a
+    # pending service deletion at a boot where the driver is not loaded - and Flowbit lives in the
+    # tray, so the driver was still loaded at shutdown, the deletion never completed, and the
+    # service stayed marked for deletion forever. Every later diagnostic reported it.
+    #
+    # WinDivert owns this service: it registers it when the driver is opened and registers it
+    # again whenever it is missing. Leaving a stopped, disabled entry behind is exactly the state
+    # WinDivert itself leaves, so there is nothing here to clean up.
     exit 0
 }
 
-# Not stopped within the deadline. Deleting now would leave the service marked for removal and
-# require a restart to clear - the exact fault this script exists to avoid - so nothing is done.
-# The service is left registered and merely stopped, which the next install can work with.
+# Still loaded. Do not delete it either - see above - and do not force it.
 exit 0

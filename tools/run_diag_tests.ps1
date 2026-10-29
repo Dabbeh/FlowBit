@@ -32,6 +32,7 @@ Write-Host '==> building test_diagnostics' -ForegroundColor Cyan
     (Join-Path $root 'src\diagnostics.cpp') `
     (Join-Path $root 'src\diagnosticspanel.cpp') `
     (Join-Path $root 'src\appmonitor.cpp') `
+    (Join-Path $root 'src\etwclass.cpp') `
     (Join-Path $root 'src\appnames.cpp') `
     (Join-Path $root 'src\theme.cpp') `
     (Join-Path $root 'src\checkmark.cpp') `

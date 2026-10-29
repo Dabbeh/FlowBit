@@ -17,6 +17,44 @@ namespace net {
 
 namespace {
 
+// A rate read from disk, bounded.
+//
+// JSON numbers are doubles. Casting one that is negative or outside qint64's range to qint64 is
+// undefined behaviour, and in practice produces a large negative number - which the pacer reads as
+// "unlimited", silently disabling a limit the user set. A hand-edited or corrupted file is enough
+// to hit it, so every rate goes through here.
+//
+// The ceiling is 100 Gbit/s in bytes: no consumer machine limits above that, and it keeps the burst
+// calculation (rate/4) far from overflow.
+RateBps clampRate(double value)
+{
+    constexpr double kMaxRateBps = 100.0 * 1000 * 1000 * 1000 / 8.0;
+    if (!(value > 0))          // also catches NaN
+        return 0;
+    if (value >= kMaxRateBps)
+        return RateBps(kMaxRateBps);
+    return RateBps(value);
+}
+
+// A weekday mask is seven bits, and a corrupted value must not silently mean "never".
+//
+// 256 truncates to 0 under a plain quint8 conversion, i.e. no days at all - a schedule that stops
+// running with no sign of why. Clamping keeps every day enabled instead, which is the reading a
+// user who wrote "every day" would expect from a damaged file.
+quint8 clampDays(int value)
+{
+    if (value < 0)
+        return 0;
+    if (value > 0x7F)
+        return 0x7F;
+    return quint8(value);
+}
+
+} // namespace
+
+
+namespace {
+
 QJsonObject ruleToJson(const Rule &rule)
 {
     QJsonObject o;
@@ -42,16 +80,16 @@ Rule ruleFromJson(const QJsonObject &o)
     rule.name = o.value(QStringLiteral("name")).toString();
     rule.from = o.value(QStringLiteral("from")).toString(rule.from);
     rule.to = o.value(QStringLiteral("to")).toString(rule.to);
-    rule.down = RateBps(o.value(QStringLiteral("downBps")).toDouble(0));
-    rule.up = RateBps(o.value(QStringLiteral("upBps")).toDouble(0));
-    rule.days = quint8(o.value(QStringLiteral("days")).toInt(0x7F));
+    rule.down = clampRate(o.value(QStringLiteral("downBps")).toDouble(0));
+    rule.up = clampRate(o.value(QStringLiteral("upBps")).toDouble(0));
+    rule.days = clampDays(o.value(QStringLiteral("days")).toInt(0x7F));
     rule.enabled = o.value(QStringLiteral("enabled")).toBool(true);
 
     // Files written before the unit change stored kibibytes under downKBps/upKBps.
     if (o.contains(QStringLiteral("downKBps")))
-        rule.down = RateBps(o.value(QStringLiteral("downKBps")).toDouble(0) * 1024.0);
+        rule.down = clampRate(o.value(QStringLiteral("downKBps")).toDouble(0) * 1024.0);
     if (o.contains(QStringLiteral("upKBps")))
-        rule.up = RateBps(o.value(QStringLiteral("upKBps")).toDouble(0) * 1024.0);
+        rule.up = clampRate(o.value(QStringLiteral("upKBps")).toDouble(0) * 1024.0);
 
     if (rule.down < 0)
         rule.down = kUnlimited;
@@ -97,8 +135,8 @@ AppRule appRuleFromJson(const QJsonObject &o)
     rule.path = o.value(QStringLiteral("path")).toString();
     rule.name = o.value(QStringLiteral("name")).toString();
     rule.exe = o.value(QStringLiteral("exe")).toString();
-    rule.down = RateBps(o.value(QStringLiteral("downBps")).toDouble(0));
-    rule.up = RateBps(o.value(QStringLiteral("upBps")).toDouble(0));
+    rule.down = clampRate(o.value(QStringLiteral("downBps")).toDouble(0));
+    rule.up = clampRate(o.value(QStringLiteral("upBps")).toDouble(0));
     rule.enabled = o.value(QStringLiteral("enabled")).toBool(true);
 
     const QJsonArray windows = o.value(QStringLiteral("windows")).toArray();
@@ -254,7 +292,19 @@ int SettingsStore::migrateLegacyData() const
         // The legacy files stay in place: if the user downgrades, the old build
         // must still find its data. This is a copy, not a move.
         if (QFile::copy(from, to)) {
-            QFile::setPermissions(to, QFile::ReadOwner | QFile::WriteOwner);
+            // Restricting the copy is part of copying it: these files hold installed paths,
+            // per-application limits and schedule times, and an inherited ACL can leave them
+            // readable by every user on the machine. A failure here is worth acting on rather
+            // than assuming, because the old location may have had looser permissions than the
+            // new one expects.
+            if (!QFile::setPermissions(to, QFile::ReadOwner | QFile::WriteOwner)) {
+                qWarning("Flowbit: migrated %s but could not restrict its permissions",
+                         qPrintable(QFileInfo(to).fileName()));
+                // Remove the unprotected copy rather than leaving private data readable: the
+                // legacy file is untouched, so nothing is lost.
+                QFile::remove(to);
+                continue;
+            }
             ++copied;
         }
     }
@@ -276,8 +326,8 @@ Settings SettingsStore::load() const
 
     const QJsonObject root = doc.object();
     settings.enabled = root.value(QStringLiteral("enabled")).toBool(false);
-    settings.defaultDown = RateBps(root.value(QStringLiteral("defaultDownBps")).toDouble(0));
-    settings.defaultUp = RateBps(root.value(QStringLiteral("defaultUpBps")).toDouble(0));
+    settings.defaultDown = clampRate(root.value(QStringLiteral("defaultDownBps")).toDouble(0));
+    settings.defaultUp = clampRate(root.value(QStringLiteral("defaultUpBps")).toDouble(0));
     settings.showThroughput = root.value(QStringLiteral("showThroughput")).toBool(true);
 
     // Startup and closing. The defaults match the struct, so a file written before these
@@ -294,6 +344,7 @@ Settings SettingsStore::load() const
         root.value(QStringLiteral("checkForUpdates")).toBool(true);
     settings.skippedVersion =
         root.value(QStringLiteral("skippedVersion")).toString();
+    settings.trayHintShown = root.value(QStringLiteral("trayHintShown")).toBool(false);
 
     // Appearance. Unknown or missing values fall back to Auto, so an older
     // settings file simply follows the OS.
@@ -378,6 +429,11 @@ bool SettingsStore::save(const Settings &settings, QString *error) const
     root.insert(QStringLiteral("checkForUpdates"), settings.checkForUpdates);
     if (!settings.skippedVersion.isEmpty())
         root.insert(QStringLiteral("skippedVersion"), settings.skippedVersion);
+
+    // Written only when true: a false value is the default, and an older Flowbit reading this
+    // file ignores the key rather than failing to parse it.
+    if (settings.trayHintShown)
+        root.insert(QStringLiteral("trayHintShown"), true);
     root.insert(QStringLiteral("themeMode"),
                 settings.themeMode == Settings::ThemeMode::Light
                     ? QStringLiteral("light")

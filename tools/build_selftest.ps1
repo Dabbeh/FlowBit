@@ -30,6 +30,7 @@ $exe = Join-Path $out 'appmon_selftest.exe'
     "-I$qt\include\QtWidgets" "-I$qt\mkspecs\win32-g++" `
     (Join-Path $root 'tools\appmon_selftest.cpp') `
     (Join-Path $root 'src\appmonitor.cpp') `
+    (Join-Path $root 'src\etwclass.cpp') `
     (Join-Path $root 'src\appnames.cpp') `
     (Join-Path $root 'src\theme.cpp') `
     (Join-Path $root 'src\checkmark.cpp') `

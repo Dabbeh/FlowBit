@@ -539,6 +539,48 @@ FlowTuple AppLimitEngine::normaliseV6Tuple(const quint32 saddr[4], quint16 sport
 // packet-layer parser produces, so v4 flow records and v4 packet keys agree.
 // (A real IPv6 address always keeps words[0]/[1] populated and the mapped
 // prefix absent, so the test is exact.)
+// Re-injects a packet, retrying a full injection queue, and counts what is lost.
+//
+// WinDivertSend() returns FALSE with ERROR_NO_BUFFER when the driver's injection queue is full -
+// normal under load, and transient. Dropping the packet there is not "best effort": a shaped
+// connection loses a segment and stalls, and nothing anywhere records why. The queue drains in
+// microseconds, so a few short retries succeed in practice; only a packet that survives the whole
+// budget is counted as lost.
+//
+// The budget is deliberately tiny (8 attempts, 200us apart = 1.6ms). This runs on the packet
+// worker, so a longer wait would turn a full queue into per-packet latency, which is a worse
+// outcome for the user than losing one packet.
+static bool injectOrCount(HANDLE handle, char *data, UINT length,
+                          const WINDIVERT_ADDRESS *addr, std::atomic<quint64> *failures)
+{
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        if (WinDivertSend(handle, data, length, nullptr, addr))
+            return true;
+
+        // Only a transient condition is worth retrying; a closed handle or a removed filter will
+        // not improve by waiting.
+        //
+        // The driver's "injection queue is full" code is not in the public Win32 headers, so the
+        // retry is gated on the documented transient codes rather than on an invented constant:
+        //   ERROR_INSUFFICIENT_BUFFER   - no room to queue the packet
+        //   ERROR_NO_SYSTEM_RESOURCES   - the driver is momentarily out of pool
+        //   ERROR_RETRY / ERROR_BUSY    - ask again
+        const DWORD error = GetLastError();
+        const bool transient = error == ERROR_INSUFFICIENT_BUFFER
+                               || error == ERROR_NO_SYSTEM_RESOURCES
+                               || error == ERROR_RETRY
+                               || error == ERROR_BUSY;
+        if (!transient) {
+            failures->fetch_add(1);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    failures->fetch_add(1);
+    return false;
+}
+
 static quint32 mappedV4ToDword(const quint32 words[4], bool *ok)
 {
     if (words[0] == 0 && words[1] == 0
@@ -880,9 +922,15 @@ void AppLimitEngine::setEnabled(bool enabled)
                     }
                 }
 
-                // Flow events MUST be re-injected or the network stack stalls.
-                WinDivertSend(static_cast<HANDLE>(impl->flowHandle), buffer.data(), recvLen,
-                              nullptr, &addr);
+                // Flow events MUST be re-injected or the network stack stalls, so a failure is
+                // counted rather than swallowed - see injectOrCount().
+                if (!injectOrCount(static_cast<HANDLE>(impl->flowHandle), buffer.data(), recvLen,
+                                   &addr, &m_injectFailures)) {
+                    const quint64 lost = m_injectFailures.load();
+                    if (lost == 1 || lost % 1000 == 0)
+                        qWarning("Flowbit: could not re-inject a flow event (%llu lost)",
+                                 static_cast<unsigned long long>(lost));
+                }
             }
         });
 
@@ -979,8 +1027,13 @@ void AppLimitEngine::setEnabled(bool enabled)
                         }
                     }
 
-                    WinDivertSend(static_cast<HANDLE>(handle), buffer.data(), recvLen, nullptr,
-                                  &addr);
+                    if (!injectOrCount(static_cast<HANDLE>(handle), buffer.data(), recvLen,
+                                       &addr, &m_injectFailures)) {
+                        const quint64 lost = m_injectFailures.load();
+                        if (lost == 1 || lost % 1000 == 0)
+                            qWarning("Flowbit: could not re-inject a shaped packet (%llu lost)",
+                                     static_cast<unsigned long long>(lost));
+                    }
                 }
             });
         };

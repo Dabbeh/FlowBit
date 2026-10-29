@@ -318,9 +318,11 @@ QString DiagnosticReport::toText() const
     return out;
 }
 
-DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, bool monitorRunning, const QString &eventLayout, const QString &addressMiss,
+DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError, quint64 eventsSeen, quint64 eventsDecoded, quint64 udpEvents, bool monitorRunning, int monitorSeconds, const QString &eventLayout, const QString &addressMiss,
                                     const QString &rawEvents,
-                                    const QString &rawBits)
+                                    const QString &rawBits,
+    const QString &eventIds,
+    const QString &consumerState)
 {
     DiagnosticReport r;
     const auto add = [&r](const QString &group, const QString &name, const QString &value,
@@ -538,18 +540,93 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
 
         // ETW delivery counters: the pair separates 'provider silent' from
         // 'payload schema changed' - entirely different fixes.
+        // Zero events means four different things, and only one of them is a fault.
+        //
+        // This row used to report a zero as a WARNING unconditionally: "the kernel network
+        // provider is delivering no events on this Windows build". That was shown on every launch
+        // where the activity panel had not been opened - because the monitor is what starts the
+        // trace session, and with no session there are no events by definition. A user reading it
+        // saw a fault on a perfectly healthy machine, which is the same mistake the activity panel
+        // made before it learned to distinguish silence from breakage.
+        //
+        //   monitor never started   -> nothing is wrong; say how to start it
+        //   running, no traffic yet -> normal on an idle machine for the first seconds
+        //   running a while, still 0 -> genuinely suspicious: warn, with the duration
+        //   events but none decoded -> the decoder does not match this build: a problem
+        const bool noEvents = eventsSeen == 0;
+        const QString monitorState =
+            !monitorRunning
+                ? QStringLiteral("The monitor is not running, so nothing is being traced. Open "
+                                 "Application Network Activity to start it; this row then counts "
+                                 "what arrives.")
+                : (noEvents && monitorSeconds < 15
+                       ? QStringLiteral("Monitoring has been running for %1s and nothing has "
+                                        "transferred in that time, so there is nothing to count "
+                                        "yet.").arg(monitorSeconds)
+                       : (noEvents
+                              ? QStringLiteral("Monitoring has been running for %1s and the kernel "
+                                               "network provider has delivered no events. Send "
+                                               "the saved report - the decoder may need this "
+                                               "build's schema.").arg(monitorSeconds)
+                              : QString()));
+
         add(QStringLiteral("Monitoring"), QStringLiteral("ETW events received"),
-            QStringLiteral("%1 (decoded: %2)").arg(eventsSeen).arg(eventsDecoded),
-            eventsSeen == 0
+            monitorRunning ? QStringLiteral("%1 (decoded: %2), %3s")
+                                 .arg(eventsSeen).arg(eventsDecoded).arg(monitorSeconds)
+                           : QStringLiteral("%1 (decoded: %2), monitor not running")
+                                 .arg(eventsSeen).arg(eventsDecoded),
+            !monitorRunning                                 ? DiagnosticItem::Status::Info
+            : (noEvents && monitorSeconds < 15)             ? DiagnosticItem::Status::Info
+            : noEvents                                      ? DiagnosticItem::Status::Warning
+                                                            : DiagnosticItem::Status::Ok,
+            monitorState);
+
+        // UDP visibility. Until now the decoder recognised only TCP send/receive, so UDP traffic
+        // (DNS, QUIC, WireGuard, games, most video calls) was invisible and the panel was quietly
+        // wrong for anyone using it. This row exists so "is UDP being counted" is answerable from
+        // the report instead of from a guess: zero here while UDP traffic is flowing means the
+        // protocol is not arriving, not that it is being counted.
+        add(QStringLiteral("Monitoring"), QStringLiteral("UDP events counted"),
+            QString::number(udpEvents),
+            udpEvents > 0 ? DiagnosticItem::Status::Ok : DiagnosticItem::Status::Info,
+            udpEvents > 0
+                ? QStringLiteral("UDP is being counted alongside TCP, so DNS, QUIC, WireGuard and "
+                                 "game traffic appear in the application list.")
+                : QStringLiteral("No UDP events in this session. UDP is counted through the same "
+                                 "ETW source as TCP; the TCP-counter fallback cannot see it. If "
+                                 "UDP traffic is flowing, send the saved report."));
+
+        // The consumer thread, separately from the session.
+        //
+        // A session can be "active" while its consumer has already returned - then the provider
+        // keeps sending and nothing reads it, which reads as a healthy session with zero events.
+        // That is precisely the state this row exists to name.
+        add(QStringLiteral("Monitoring"), QStringLiteral("ETW consumer"),
+            consumerState.isEmpty() ? QStringLiteral("unknown") : consumerState,
+            consumerState.startsWith(QStringLiteral("stopped"))
                 ? DiagnosticItem::Status::Warning
                 : DiagnosticItem::Status::Ok,
-            eventsSeen == 0
-                ? QStringLiteral("The kernel network provider is delivering no "
-                                  "events on this Windows build. Attempting a new "
-                                  "session with the full keyword mask may help; if it "
-                                  "persists, send the saved report - the decoder needs "
-                                  "this build's schema.")
-                : QString());
+            consumerState.startsWith(QStringLiteral("stopped"))
+                ? QStringLiteral("The thread that reads events has returned while the session is "
+                                 "still active, so no events are being counted. ProcessTrace's "
+                                 "return code is shown; Flowbit rebuilds the consumer up to twice "
+                                 "per run and reports the restarts.")
+                : QStringLiteral("The thread that reads the provider's events is running."));
+
+        // Which ids the provider actually delivers.
+        //
+        // Two UDP diagnoses in a row were wrong because they were reasoned rather than observed.
+        // This row makes the stream inspectable: if 42/43/58/59 appear here, UDP is arriving and
+        // any remaining zero elsewhere is a decoding problem; if they do not, the events are not
+        // being emitted for this session and the answer is the kernel logger, not this decoder.
+        add(QStringLiteral("Monitoring"), QStringLiteral("Event ids seen"),
+            eventIds.isEmpty() ? QStringLiteral("none yet") : eventIds,
+            eventIds.isEmpty() ? DiagnosticItem::Status::Info : DiagnosticItem::Status::Ok,
+            eventIds.isEmpty()
+                ? QStringLiteral("No events have been delivered yet in this session.")
+                : QStringLiteral("Counts per event id, most frequent first. TCP send/receive are 10 "
+                                 "and 11 (26/27 for IPv6); UDP send/receive are 42 and 43 (58/59 "
+                                 "for IPv6)."));
 
         // Phase 0.1 evidence: raw address bits and the local address list.
         // Placed first in MONITORING because it is what the direction fix is

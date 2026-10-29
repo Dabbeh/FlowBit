@@ -14,6 +14,7 @@ CONFIG += c++17 windows
 CONFIG -= console
 TEMPLATE = app
 TARGET = Flowbit
+VERSION = 1.0.2
 
 # Per-configuration output dirs, mirroring the layout used by the scripts.
 CONFIG(debug, debug|release) {
@@ -49,7 +50,7 @@ WINDIVERT_ROOT = $$PWD/third_party/WinDivert/WinDivert-2.2.2-A
 WINDIVERT_ARCH = $$WINDIVERT_ROOT/x64
 
 INCLUDEPATH += $$WINDIVERT_ROOT/include
-LIBS += -L$$WINDIVERT_ARCH -lwindivert
+LIBS += -L$$WINDIVERT_ARCH -lwindivert -lwinmm
 LIBS += -liphlpapi -lws2_32 -lshell32 -luser32
 # ETW session management and payload decoding for per-application monitoring.
 LIBS += -ladvapi32 -ltdh
@@ -59,6 +60,7 @@ LIBS += -ldwmapi
 LIBS += -lwinmm
 
 SOURCES += \
+    src/etwclass.cpp \
     src/main.cpp \
     src/selftest.cpp \
     src/brandmark.cpp \
@@ -100,6 +102,7 @@ SOURCES += \
     src/mainwindow.cpp
 
 HEADERS += \
+    src/etwclass.h \
     src/selftest.h \
     src/throttleengine.h \
     src/driverprobe.h \

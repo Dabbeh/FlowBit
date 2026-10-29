@@ -28,4 +28,3 @@ if ($LASTEXITCODE -ne 0) { throw 'Dashboard animation test failed to compile' }
 Copy-Item "$root\third_party\WinDivert\WinDivert-2.2.2-A\x64\WinDivert.dll" $out -Force
 & $exe
 exit $LASTEXITCODE
-

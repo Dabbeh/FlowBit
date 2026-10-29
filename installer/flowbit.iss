@@ -34,7 +34,7 @@
 ; need administrative rights, which is what this installer requests.
 
 #define AppName "Flowbit"
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 #define AppPublisher "Flowbit"
 #define AppExeName "Flowbit.exe"
 
@@ -104,10 +104,22 @@ Source: "..\build\release\tls\*";               DestDir: "{app}\tls";           
 Source: "..\build\release\networkinformation\*"; DestDir: "{app}\networkinformation"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 Source: "..\build\release\generic\*";           DestDir: "{app}\generic";           Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
 
+; onlyifdoesntexist is deliberate on the driver files.
+;
+; Copying them over a loaded driver is what makes Windows disable the service and mark it for
+; deletion - the state that reads DISABLED forever and that no amount of restarting clears. These
+; two binaries are byte-identical in every build Flowbit has shipped, so there is nothing to
+; update: if the file is already there, leave it alone.
+;
+; If a future release does need a different driver, this flag must be dropped for that release and
+; the service stopped first.
+
 ; The driver. Both files must sit beside the executable: WinDivert.dll loads
 ; WinDivert64.sys from the same directory, and it registers that path with the service.
-Source: "..\build\release\WinDivert.dll";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\build\release\WinDivert64.sys"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\build\release\WinDivert.dll";   DestDir: "{app}"; \
+    Flags: ignoreversion onlyifdoesntexist
+Source: "..\build\release\WinDivert64.sys"; DestDir: "{app}"; \
+    Flags: ignoreversion onlyifdoesntexist
 
 ; The script the uninstaller runs to stop and deregister the driver in the right order. Kept
 ; beside the application rather than generated at uninstall time, so it is the same file every

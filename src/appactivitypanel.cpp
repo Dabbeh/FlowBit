@@ -49,6 +49,18 @@ QTableWidgetItem *makeItem(const QString &text, Qt::Alignment align)
     return item;
 }
 
+
+// Reveal and settle timing.
+//
+// 280ms is the reveal: InOutSine starts at zero velocity, so a shorter duration reads as a
+// hesitation before the panel moves at all. The settle is deliberately much shorter - it is
+// a correction, not a second movement, and anything longer would read as two motions.
+// 340ms rather than 280ms: the reveal has to travel ~190-500px depending on row count, and
+// at 280ms the fastest frames stepped 17px each - measured - which reads as chunky rather
+// than smooth. A longer duration does not change the curve's shape, only how many frames
+// share the distance.
+constexpr int kRevealMs = 340;
+constexpr int kSettleMs = 140;
 } // namespace
 
 AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
@@ -224,6 +236,16 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     m_scopeNoteLabel->setText(QStringLiteral(
         "Measuring TCP traffic only \u2014 UDP/QUIC apps may read lower than the "
         "system total."));
+    // The visible line says WHAT the table is measuring; the tooltip says WHY, because the answer
+    // is a state the user cannot see from here: the detailed source is silent, so Flowbit is on the
+    // TCP-counter fallback. Without this the note reads as a permanent limitation of the app rather
+    // than as a description of the source currently in use.
+    m_scopeNoteLabel->setToolTip(
+        QStringLiteral("The detailed ETW source has delivered no events in this session, so "
+                       "per-application figures come from Windows' TCP connection counters. Those "
+                       "counters have no UDP data at all.\n\nSettings \u2192 Diagnostics shows the "
+                       "ETW consumer state and which event ids arrived - that is where to look if "
+                       "this note stays visible while traffic is flowing."));
     // Wrapped, because an unwrapped label demands its whole text on one line and a layout takes
     // that as a minimum width for the panel. A sentence here made the panel wider than the
     // window, which pushed the table's columns off the right edge - in a full-screen window as
@@ -272,7 +294,10 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     m_rankTimer = new QTimer(this);
     m_rankTimer->setInterval(kRankIntervalMs);
     connect(m_rankTimer, &QTimer::timeout, this, [this] {
-        if (m_expanded)
+        // Expanded AND on screen. The timer used to rebuild the table while the panel was
+        // collapsed out of sight or while another page was showing, which cost a re-sort and a
+        // full row rebuild every three seconds for output nobody could see.
+        if (m_expanded && isVisible() && !m_animating)
             refresh();
     });
     m_rankTimer->start();
