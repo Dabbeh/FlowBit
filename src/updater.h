@@ -9,6 +9,7 @@ class QProgressDialog;
 class QWidget;
 
 namespace net {
+class UpdateDownloadDialog;
 
 // Checking for, downloading and installing a newer Flowbit, from inside the application.
 //
@@ -60,6 +61,7 @@ public:
     // Reads the version file and compares it with the running version. Emits
     // updateAvailable() or upToDate(); never downloads anything.
     void checkForUpdate();
+    bool isBusy() const { return m_checking || m_offerVisible || m_progress; }
 
     // Offers an update to the user and, if accepted, downloads and installs it.
     //
@@ -96,7 +98,9 @@ private:
 
     QWidget *m_ui = nullptr;
     QNetworkAccessManager *m_net = nullptr;
-    QProgressDialog *m_progress = nullptr;
+    UpdateDownloadDialog *m_progress = nullptr;
+    bool m_checking = false;
+    bool m_offerVisible = false;
     QString m_pendingVersion;
     QString m_offeredSha256;
 };

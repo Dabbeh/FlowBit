@@ -59,7 +59,11 @@ will delete a download that does not match. Compute it from the built file:
 (Get-FileHash .\Flowbit.exe -Algorithm SHA256).Hash.ToLower()
 ```
 
-Commit that to `main`. Every Flowbit with automatic checks on will see it within one start.
+Commit that to `main` after verifying the assets. With automatic checks enabled,
+Flowbit 1.0.3 and later check five seconds after launch and every 30 minutes while
+running. A newer version opens the update offer automatically, including when the
+window is in the tray. Later postpones the next offer for 30 minutes; skipped
+versions remain skipped. Earlier builds check on launch.
 
 ## Using `releases/latest/download` instead
 

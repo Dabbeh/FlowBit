@@ -1454,7 +1454,7 @@ QWidget *MainWindow::buildSettingsPage()
         m_updateCheck->setStyleSheet(QStringLiteral("QCheckBox { padding-left: %1px; }")
                                          .arg(280 - 18 - 2));
         m_updateCheck->setToolTip(QStringLiteral(
-            "Looks for a newer version when Flowbit starts. Nothing is downloaded unless "
+            "Looks for a newer version on startup and every 30 minutes. Nothing is downloaded unless "
             "you accept it."));
         connect(m_updateCheck, &QCheckBox::toggled, this, [this](bool on) {
             if (m_loading)
@@ -1463,6 +1463,8 @@ QWidget *MainWindow::buildSettingsPage()
             s.checkForUpdates = on;
             QString error;
             persistSettings(s, QStringLiteral("your settings"));
+            if (on)
+                checkForUpdatesNow(false);
         });
         updateRow->addWidget(m_updateCheck);
         cl->addLayout(updateRow);
@@ -2110,6 +2112,11 @@ void MainWindow::buildTray()
     // The updater lives as long as the window. It is created here rather than inside the
     // settings page so a check can also be started at launch.
     m_updater = new Updater(this);
+    m_updatePoll = new QTimer(this);
+    m_updatePoll->setObjectName(QStringLiteral("automaticUpdateTimer"));
+    m_updatePoll->setInterval(30 * 60 * 1000);
+    connect(m_updatePoll, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
+    m_updatePoll->start();
 
     // Connected once, not per check: a second check used to stack another pair of
     // handlers, so a deferral restarted the snooze timer several times.
@@ -2128,6 +2135,7 @@ void MainWindow::buildTray()
 
         if (!m_updateSnooze) {
             m_updateSnooze = new QTimer(this);
+            m_updateSnooze->setObjectName(QStringLiteral("updateSnoozeTimer"));
             m_updateSnooze->setSingleShot(true);
             m_updateSnooze->setInterval(kUpdateSnoozeMs);
             connect(m_updateSnooze, &QTimer::timeout, this, [this] { checkForUpdatesNow(false); });
@@ -2305,9 +2313,8 @@ void MainWindow::loadFromStore()
     // and applying the first limits, and a network request competing with that would be the
     // wrong priority. Nothing depends on the answer arriving quickly, and a failure stays
     // silent - the network being down is not something to interrupt anyone over.
-    static bool updateCheckStarted = false;
-    if (!updateCheckStarted && settings.checkForUpdates) {
-        updateCheckStarted = true;
+    if (!m_updateStartupScheduled && settings.checkForUpdates) {
+        m_updateStartupScheduled = true;
         QTimer::singleShot(5000, this, [this] {
             if (m_updater)
                 checkForUpdatesNow(false);
@@ -4002,6 +4009,11 @@ void MainWindow::setUpdateStatus(const QString &text, bool isError)
 
 void MainWindow::checkForUpdatesNow(bool announce)
 {
+    if (!announce && (!m_store->load().checkForUpdates
+        || (m_updateSnooze && m_updateSnooze->isActive())))
+        return;
+    if (m_updater && m_updater->isBusy())
+        return;
     if (!m_updater) {
         if (announce)
             QMessageBox::information(this, QStringLiteral("Updates"),
@@ -4042,6 +4054,10 @@ void MainWindow::checkForUpdatesNow(bool announce)
                 }
 
                 setUpdateStatus(QStringLiteral("Version %1 is available.").arg(version), false);
+                if (!isVisible() || isMinimized())
+                    showNormal();
+                raise();
+                activateWindow();
                 m_updater->offerUpdate(version, url, notes);
                 once->deleteLater();
             });

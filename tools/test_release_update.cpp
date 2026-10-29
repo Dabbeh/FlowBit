@@ -14,7 +14,8 @@
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
-    if (argc != 4) return 2;
+    if (argc != 4 && argc != 5) return 2;
+    const QString expectedVersion = argc == 5 ? QString::fromLocal8Bit(argv[4]) : QStringLiteral("1.0.2");
     app.setApplicationVersion(QString::fromLocal8Bit(argv[2]));
     net::Updater::setVersionFileUrl(QUrl::fromUserInput(QString::fromLocal8Bit(argv[1])).toString());
     net::Updater updater(nullptr);
@@ -23,10 +24,10 @@ int main(int argc, char **argv)
     bool available = false, current = false, failed = false;
     QObject::connect(&updater, &net::Updater::updateAvailable,
         [&](const QString &version, const QString &url, const QString &) {
-            available = version == QStringLiteral("1.0.2"); download = url; loop.quit();
+            available = version == expectedVersion; download = url; loop.quit();
         });
     QObject::connect(&updater, &net::Updater::upToDate, [&](const QString &version) {
-        current = version == QStringLiteral("1.0.2"); loop.quit();
+        current = version == expectedVersion; loop.quit();
     });
     QObject::connect(&updater, &net::Updater::failed, [&](const QString &why) {
         std::printf("FAIL: %s\n", qPrintable(why)); failed = true; loop.quit();
@@ -38,9 +39,9 @@ int main(int argc, char **argv)
     updater.checkForUpdate();
     loop.exec();
     timeout.stop();
-    const bool expectNew = app.applicationVersion() != QStringLiteral("1.0.2");
+    const bool expectNew = app.applicationVersion() != expectedVersion;
     if (failed || (expectNew ? !available : !current)) return 1;
-    std::printf("PASS: running %s receives the correct 1.0.2 update result\n", argv[2]);
+    std::printf("PASS: running %s receives the correct %s update result\n", argv[2], qPrintable(expectedVersion));
     if (!expectNew) return 0;
     QNetworkAccessManager network;
     QNetworkRequest request{QUrl(download)};

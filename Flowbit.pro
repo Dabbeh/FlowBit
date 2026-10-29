@@ -14,7 +14,7 @@ CONFIG += c++17 windows
 CONFIG -= console
 TEMPLATE = app
 TARGET = Flowbit
-VERSION = 1.0.2
+VERSION = 1.0.3
 
 # Per-configuration output dirs, mirroring the layout used by the scripts.
 CONFIG(debug, debug|release) {
@@ -126,6 +126,7 @@ HEADERS += \
     src/crossticon.h \
     src/scrollbaranimator.h \
     src/updater.h \
+    src/updatedownloaddialog.h \
     src/busydots.h \
     src/navicons.h \
     src/navbutton.h \

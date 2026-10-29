@@ -1,4 +1,5 @@
 #include "updater.h"
+#include "updatedownloaddialog.h"
 
 #include <QApplication>
 #include <QCoreApplication>
@@ -17,6 +18,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QStandardPaths>
+#include <QScopedValueRollback>
 #include <QUrl>
 
 namespace net {
@@ -103,6 +105,9 @@ Updater::Updater(QWidget *parentForDialogs) : m_ui(parentForDialogs)
 
 void Updater::checkForUpdate()
 {
+    if (isBusy())
+        return;
+    m_checking = true;
     QNetworkRequest request{QUrl(versionFileUrl())};
     // GitHub serves raw files with a short cache life; asking explicitly avoids a stale
     // "up to date" from a proxy.
@@ -120,6 +125,7 @@ void Updater::checkForUpdate()
 
 void Updater::onVersionReply(QNetworkReply *reply)
 {
+    m_checking = false;
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
@@ -170,7 +176,11 @@ void Updater::onVersionReply(QNetworkReply *reply)
 
 void Updater::offerUpdate(const QString &version, const QString &url, const QString &notes)
 {
+    if (isBusy())
+        return;
+    m_offerVisible = true;
     beginDownload(version, url, notes);
+    m_offerVisible = false;
 }
 
 void Updater::beginDownload(const QString &version, const QString &url, const QString &notes)
@@ -247,15 +257,8 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
         return;
     }
 
-    m_progress = new QProgressDialog(
-        QStringLiteral("Downloading Flowbit %1...").arg(version),
-        QStringLiteral("Cancel"), 0, 100, m_ui);
-    m_progress->setWindowTitle(QStringLiteral("Updating Flowbit"));
-    m_progress->setWindowModality(Qt::WindowModal);
-    m_progress->setMinimumDuration(0);
-    m_progress->setAutoClose(false);
-    m_progress->setAutoReset(false);
-    m_progress->setValue(0);
+    m_progress = new UpdateDownloadDialog(version, m_ui);
+    m_progress->show();
 
     QNetworkRequest request{downloadUrl};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
@@ -273,15 +276,14 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
 
     connect(reply, &QNetworkReply::downloadProgress, this,
             [this](qint64 got, qint64 total) {
-                if (!m_progress || total <= 0)
+                if (!m_progress)
                     return;
-                m_progress->setMaximum(100);
-                m_progress->setValue(int(got * 100 / total));
+                m_progress->setProgress(got, total);
             });
 
     // Cancelling must stop the transfer and leave nothing behind, or a half-written
     // executable would be there for the next attempt to trip over.
-    connect(m_progress, &QProgressDialog::canceled, this, [reply] {
+    connect(m_progress, &QDialog::rejected, this, [reply] {
         if (reply->isRunning())
             reply->abort();
     });
@@ -289,10 +291,12 @@ void Updater::beginDownload(const QString &version, const QString &url, const QS
     const QString sha256 = m_offeredSha256;
     connect(reply, &QNetworkReply::finished, this,
             [this, reply, file, staged, version, sha256] {
+        QScopedValueRollback<bool> processing(m_offerVisible, true);
         if (file->isOpen()) {
             file->write(reply->readAll());
             file->close();
         }
+        file->deleteLater();
         reply->deleteLater();
         if (m_progress) {
             m_progress->close();

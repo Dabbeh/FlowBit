@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$FeedUrl, [string]$RunningVersion="1.0.1", [Parameter(Mandatory=$true)][string]$ExpectedSha256)
+param([Parameter(Mandatory=$true)][string]$FeedUrl, [string]$RunningVersion="1.0.1", [Parameter(Mandatory=$true)][string]$ExpectedSha256, [string]$ExpectedVersion="1.0.2")
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $qt = 'C:\Qt\6.10.0\mingw_64'
@@ -27,5 +27,5 @@ $exe = Join-Path $out 'test_release_update.exe'
     -lshell32 -luser32 -lwinmm -o $exe
 if ($LASTEXITCODE -ne 0) { throw 'Release update test failed to compile' }
 Copy-Item "$root\third_party\WinDivert\WinDivert-2.2.2-A\x64\WinDivert.dll" $out -Force
-& $exe $FeedUrl $RunningVersion $ExpectedSha256
+& $exe $FeedUrl $RunningVersion $ExpectedSha256 $ExpectedVersion
 exit $LASTEXITCODE

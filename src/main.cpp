@@ -103,7 +103,7 @@ int main(int argc, char *argv[])
     // organisation. Existing data is migrated by SettingsStore, which recognises the nested
     // directory as a legacy location.
     QApplication::setApplicationDisplayName(QStringLiteral("Flowbit"));
-    QApplication::setApplicationVersion(QStringLiteral("1.0.2"));
+    QApplication::setApplicationVersion(QStringLiteral("1.0.3"));
 
     // Give Windows an explicit application identity.
     //

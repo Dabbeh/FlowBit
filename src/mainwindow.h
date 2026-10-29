@@ -375,6 +375,8 @@ private:
     // Re-offers a postponed update later in the same session. One timer, restarted on each
     // deferral, so repeated "Later" clicks cannot queue several prompts.
     QTimer *m_updateSnooze = nullptr;
+    QTimer *m_updatePoll = nullptr;
+    bool m_updateStartupScheduled = false;
 
     // How long a postponed update waits before it is mentioned again.
     static constexpr int kUpdateSnoozeMs = 30 * 60 * 1000;
