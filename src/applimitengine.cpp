@@ -753,6 +753,7 @@ void AppLimitEngine::onScheduleTick()
     if (m_impl->stop.load())
         return;
 
+    const auto previous = states();
     // 1. Recompute which rules are active (their schedule windows cover now).
     m_impl->reevaluate();
 
@@ -760,6 +761,17 @@ void AppLimitEngine::onScheduleTick()
     //    active set had its bucket erased in reevaluate(), so its traffic is no
     //    longer paced - the limit is genuinely lifted at the window's end.
     applyBucketsFromStates();
+    const auto current = states();
+    bool changed = previous.size() != current.size();
+    for (int i = 0; !changed && i < current.size(); ++i) {
+        const auto &before = previous.at(i);
+        const auto &after = current.at(i);
+        changed = before.ruleId != after.ruleId || before.active != after.active
+            || before.down != after.down || before.up != after.up
+            || before.matchedWindow != after.matchedWindow || before.reason != after.reason;
+    }
+    if (changed)
+        emit stateChanged();
 }
 
 void AppLimitEngine::setEnabled(bool enabled)

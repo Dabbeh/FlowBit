@@ -75,6 +75,7 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <memory>
 
 namespace net {
 
@@ -116,6 +117,19 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
     // session only begins when the Application Network Activity panel is expanded,
     // so a user who never opens it pays no cost. The monitor owns its own thread.
     m_appMonitor = new AppMonitor(this);
+    connect(m_appMonitor, &AppMonitor::updated, this, [this] {
+        // A completed interval is recorded exactly once, including intervals
+        // lengthened by a UI transition. Reading it from the speed timer could
+        // record the same snapshot again while the app-monitor tick was deferred.
+        for (const AppTraffic &traffic : m_appMonitor->snapshot()) {
+            const QString path = traffic.executablePath.isEmpty() ? traffic.executableName
+                                                                  : traffic.executablePath;
+            if (!path.isEmpty())
+                m_usage->addAppSample(path,
+                    traffic.displayName.isEmpty() ? traffic.executableName : traffic.displayName,
+                    traffic.bytesIn, traffic.bytesOut);
+        }
+    });
 
     // Per-application limiting. Also created up front and started only once the
     // user has rules, so a machine with none never pays for the driver handles.
@@ -171,6 +185,10 @@ MainWindow::MainWindow(SettingsStore *store, ThrottleEngine *engine, SpeedMonito
     m_appRefreshTimer = new QTimer(this);
     m_appRefreshTimer->setInterval(1000);
     connect(m_appRefreshTimer, &QTimer::timeout, this, [this] {
+        // OS counter polling and row updates share the animation's GUI thread.
+        // Bytes keep accumulating; the next tick includes the deferred interval.
+        if (m_appPanel && m_appPanel->isAnimating())
+            return;
         // Advance the monitoring intervals first, then redraw what they produced.
         // The 1s cadence is what keeps the per-application graph ticking; without
         // this driver the ingested bytes never became a finished snapshot.
@@ -756,38 +774,8 @@ QWidget *MainWindow::buildDashboardPage()
     canvasLayout->setContentsMargins(0, 0, 0, 0);
     canvasLayout->setSpacing(12);
 
-    // Pin the canvas to the size its contents require.
-    //
-    // Measured at the user's real window size (1536x816 logical = 1920x1080 at 125%
-    // scaling): opening the panel made the two cards in the top row change height by
-    // 14px, and the row itself by 7px, which is the "graph gets pushed" movement.
-    // The cause is that this canvas is a layout inside a widgetResizable QScrollArea,
-    // so when the canvas crosses the viewport height - exactly what the 188px panel
-    // makes it do at 816px tall - Qt re-distributes the available space and the top
-    // cards absorb a few pixels.
-    //
-    // Qt documents SetMinAndMaxSize as the way to stop that: the canvas then takes
-    // precisely the size its contents require, so adding the panel changes the canvas
-    // by the panel's height and nothing above it moves. The trailing addStretch(1)
-    // still absorbs surplus space when the window is taller than the content.
-    // NOT SetMinAndMaxSize.
-    //
-    // That mode makes the layout take its own size HINT rather than the viewport's width, so
-    // inside a widgetResizable scroll area the canvas is only as wide as its content asks for.
-    // The pair's hint is 386px, so the canvas stayed near that and the activity table's
-    // Download, Upload and Total columns were laid out past the window's right edge - visible
-    // only as clipped fragments of text at the border.
-    //
-    // It was added to stop the graph jittering when the panel opened: the canvas crossing the
-    // viewport HEIGHT made Qt redistribute space and the top cards absorbed a few pixels. That
-    // measurement was right and the problem is real, but freezing the height by freezing the
-    // whole geometry also froze the width.
-    //
-    // The height is held steady by ResponsivePair instead, which pins its own minimum and
-    // maximum height to the cards' natural height - the mechanism built for this, and the one
-    // whose comment describes removing the slack a parent layout would otherwise argue over.
-    // With setWidgetResizable(true) above, the canvas width now tracks the viewport, which is
-    // what the table needs to lay its columns out inside the window.
+    // The viewport owns the width. ResponsivePair keeps the graph and usage
+    // cards at their natural height while the activity panel changes its clip.
 
     // -- top row: Live Speed | 30-Day Usage --------------------------------
     // Side by side when there is room, stacked when there is not. A plain
@@ -821,66 +809,90 @@ QWidget *MainWindow::buildDashboardPage()
             topPair->takeMiddle(m_appPanel);
             canvasLayout->insertWidget(1, m_appPanel);   // right after the row
         }
-        m_appPanel->setVisible(m_appPanel->isExpanded());
+        m_appPanel->setVisible(m_appPanel->isExpanded() || m_appPanel->isAnimating());
     };
 
     connect(m_appPanel, &AppActivityPanel::expandedChanged, this, [this](bool expanded) {
-        // The panel animates its own visibility/height; only the toggle label
-        // changes here. The viewport does NOT move during the tween.
-        //
-        // Why nothing scrolls here: the scroll range keeps changing while the
-        // panel grows or shrinks, so any target computed now is a guess - and it
-        // was a guess that clamped the viewport toward the content bottom while
-        // the height tween fought it. The measured result was the "pushed to the
-        // bottom" feel. Both motions are now strictly sequential: the panel
-        // finishes, THEN one minimal glide runs (see the revealFinished handler).
         if (m_showMoreButton)
             m_showMoreButton->setText(expanded ? QStringLiteral("Show Less \u02C4")
                                                : QStringLiteral("Show More \u02C4"));
-        if (!expanded && m_dashScrollAnim)
-            m_dashScrollAnim->stop();   // a queued bring-back glide is stale now
     });
 
-    // The viewport deliberately does NOT move during the reveal.
-    //
-    // Every scroll-coupled variant was measured before landing here:
-    //   * glide-to-panel-top:  dragged the top row out of view.
-    //   * follow-the-bottom:   same, plus it shoved everything upward, which the
-    //                          user reported as "it pushes it to top".
-    // The press point is the anchor: the graph card stays exactly where it is and
-    // the panel grows downward below it. Scrolling after that is the user's call.
-
-    // One glide after the tween settles - the smallest movement that leaves the
-    // situation correct.
-    //
-    //  * Expand: the panel ungrew in place under a still viewport, so it may hang
-    //    below the fold. Glide down just far enough to bring its BOTTOM edge (+ a
-    //    small margin) inside the viewport - never all the way to the top of the
-    //    panel, never to the end of the content.
-    //  * Collapse: content below the panel slid up under a still viewport, so the
-    //    toggle may now sit above the fold. Glide up just far enough to show it
-    //    again - so the user can press it once more without hunting for it.
-    connect(m_appPanel, &AppActivityPanel::revealFinished, this, [this] {
-        if (!m_dashScroll || !m_appPanel)
-            return;
-        auto *bar = m_dashScroll->verticalScrollBar();
-        if (!bar)
-            return;
-
-        if (m_appPanel->isExpanded()) {
-            // The viewport never moved during the reveal; nothing to correct and
-            // no post-glide on expand.
-        } else {
-            QWidget *canvas = m_dashScroll->widget();
-            if (!canvas || !m_showMoreButton)
-                return;
-            const int toggleY = m_showMoreButton->mapTo(canvas, QPoint(0, 0)).y();
-            if (toggleY >= bar->value())
-                return;   // still visible: nothing to do
-            glideDashboardScrollTo(qMax(0, toggleY - 12), 240);
+    struct RevealAnchor {
+        int savedMinimum = -1;
+        int from = 0;
+        int to = 0;
+        int scrollFrom = 0;
+        int scrollTo = 0;
+        bool userScrolled = false;
+    };
+    const auto anchor = std::make_shared<RevealAnchor>();
+    // Reserve enough canvas for BOTH endpoints before the first frame. Letting
+    // QScrollArea grow it later can lay out a taller panel in a too-short canvas
+    // for a frame, squeezing the gaps and visibly moving the card up and down.
+    // The trailing stretch takes the unused room during the reveal.
+    connect(m_appPanel, &AppActivityPanel::revealStarted, this,
+            [this, canvas, canvasLayout, scroll, anchor](int from, int to) {
+        auto *bar = scroll->verticalScrollBar();
+        if (anchor->savedMinimum < 0)
+            anchor->savedMinimum = canvas->minimumHeight();
+        anchor->from = from;
+        anchor->to = to;
+        anchor->scrollFrom = bar->value();
+        anchor->userScrolled = false;
+        const int finalContent = canvasLayout->minimumSize().height() - from + to;
+        const int finalMaximum = qMax(0, finalContent - scroll->viewport()->height());
+        anchor->scrollTo = to < from ? qMin(bar->value(), finalMaximum) : bar->value();
+        if (to == 0 && m_showMoreButton) {
+            const int toggleY = m_showMoreButton->mapTo(canvas, QPoint()).y();
+            anchor->scrollTo = qMin(anchor->scrollTo, qMax(0, toggleY - 12));
+            // Hiding a focused footer otherwise transfers focus to the next
+            // card, making QScrollArea jump down after the reveal has ended.
+            // Return focus to the opener now, keeping scrolling on the same
+            // animation timeline instead of Qt's immediate ensure-visible.
+            if (auto *focus = QApplication::focusWidget();
+                focus && m_appPanel->isAncestorOf(focus)) {
+                m_showMoreButton->setFocus(Qt::OtherFocusReason);
+                bar->setValue(anchor->scrollFrom);
+            }
         }
+        const int reservedHeight = qMax(qMax(canvas->height(), finalContent), anchor->savedMinimum);
+        canvas->setMinimumHeight(reservedHeight);
+        canvasLayout->activate();
     });
-
+    connect(m_appPanel, &AppActivityPanel::revealTick, this,
+            [scroll, anchor, topPair, canvasLayout](int height) {
+        // In the narrow layout the panel is a grandchild of the canvas. Its
+        // new height invalidates the inner layout first; waiting for the outer
+        // LayoutRequest lets the inner layout paint with the previous height,
+        // compressing or spreading its gaps for one frame. Propagate and apply
+        // the new size through both layout levels before any repaint.
+        if (topPair->isStacked()) {
+            topPair->layout()->activate();
+            topPair->updateGeometry();
+            canvasLayout->activate();
+        }
+        if (anchor->savedMinimum < 0 || anchor->from == anchor->to || anchor->userScrolled)
+            return;
+        const qreal progress = qBound(0.0, qreal(height - anchor->from)
+                                             / (anchor->to - anchor->from), 1.0);
+        scroll->verticalScrollBar()->setValue(qRound(anchor->scrollFrom
+            + progress * (anchor->scrollTo - anchor->scrollFrom)));
+    });
+    connect(scroll->verticalScrollBar(), &QAbstractSlider::actionTriggered, this,
+            [anchor](int) { anchor->userScrolled = true; });
+    connect(scroll->verticalScrollBar(), &QAbstractSlider::sliderPressed, this,
+            [anchor] { anchor->userScrolled = true; });
+    connect(m_appPanel, &AppActivityPanel::revealFinished, this, [this, canvas, anchor] {
+        if (anchor->savedMinimum >= 0) {
+            canvas->setMinimumHeight(anchor->savedMinimum);
+            anchor->savedMinimum = -1;
+        }
+        QTimer::singleShot(0, this, [this] {
+            if (!m_appPanel->isAnimating())
+                refreshUsage();
+        });
+    });
     connect(topPair, &ResponsivePair::orientationChanged, this, placeAppPanel);
     // Apply the initial placement: applyLayout may already have decided "stacked"
     // before this panel existed, in which case no orientation signal will come.
@@ -1762,6 +1774,31 @@ QWidget *MainWindow::buildUsageCard(QWidget *parent)
     quotaRow->addStretch(1);
     layout->addLayout(quotaRow);
 
+    auto *splitRow = new QHBoxLayout();
+    splitRow->setSpacing(24);
+    splitRow->setContentsMargins(0, 10, 0, 0);
+    const auto addSplit = [&](const QString &caption, const QString &name, QLabel **value) {
+        auto *column = new QVBoxLayout();
+        column->setSpacing(2);
+        auto *label = new QLabel(caption, card);
+        label->setObjectName(QStringLiteral("sub"));
+        *value = new QLabel(QStringLiteral("--"), card);
+        (*value)->setObjectName(name);
+        (*value)->setFont(theme::counterFont(11, true));
+        column->addWidget(label);
+        column->addWidget(*value);
+        splitRow->addLayout(column);
+    };
+    addSplit(QStringLiteral("Downloaded"), QStringLiteral("usageDownloaded"), &m_usageSplitDown);
+    addSplit(QStringLiteral("Uploaded"), QStringLiteral("usageUploaded"), &m_usageSplitUp);
+    splitRow->addStretch(1);
+    layout->addLayout(splitRow);
+
+    m_usageProjection = new QLabel(QStringLiteral("At this rate: --"), card);
+    m_usageProjection->setObjectName(QStringLiteral("usageProjection"));
+    m_usageProjection->setWordWrap(true);
+    layout->addWidget(m_usageProjection);
+
     layout->addStretch(1);
 
     // Action tray: its own row, with real margins and a floor on button width so
@@ -2615,49 +2652,12 @@ void MainWindow::onRuleRowChanged()
     persistAndApply();
 }
 
-void MainWindow::glideDashboardScrollTo(int target, int milliseconds)
-{
-    if (!m_dashScroll)
-        return;
-    QScrollBar *bar = m_dashScroll->verticalScrollBar();
-    if (!bar)
-        return;
-    target = qBound(bar->minimum(), target, bar->maximum());
-    if (qAbs(target - bar->value()) < 2)
-        return;   // not far enough to be worth animating
-
-    // Retire any glide still in flight. stop() + deleteLater() only - never
-    // DeleteWhenStopped as well, which destroyed the object twice.
-    if (m_dashScrollAnim) {
-        m_dashScrollAnim->stop();
-        m_dashScrollAnim->deleteLater();
-        m_dashScrollAnim = nullptr;
-    }
-
-    auto *anim = new QPropertyAnimation(bar, QByteArrayLiteral("value"), this);
-    anim->setDuration(qMax(120, milliseconds));
-    anim->setEasingCurve(QEasingCurve::OutCubic);
-    anim->setStartValue(bar->value());
-    anim->setEndValue(target);
-    m_dashScrollAnim = anim;
-    // The finished handler compares pointers instead of holding a second owning
-    // reference: the animation's parent (this) owns it, and deleteLater runs once.
-    connect(anim, &QAbstractAnimation::finished, this, [this, anim] {
-        if (m_dashScrollAnim == anim)
-            m_dashScrollAnim = nullptr;
-        anim->deleteLater();
-    });
-    anim->start();
-}
-
 void MainWindow::persistAndApply()
 {
     // Make the driver ready before anything tries to use it.
     //
-    // The disabled-and-loaded state (START_TYPE 4, STATE 4) is invisible to an open that
-    // succeeds against an already-loaded driver, and only bites at the NEXT load - after a
-    // reboot, or when the last handle closes. Repairing here rather than after the first
-    // failure is what turns "it is off at first, then it turns on" into nothing visible.
+    // Readiness checks actual driver access before considering service recovery:
+    // WinDivert's temporary registration can read DISABLED while working normally.
     //
     // Once only: the condition changes when the files on disk change, not while the
     // application runs, and an SCM round trip on every settings change would be wasted work.
@@ -2937,6 +2937,23 @@ void MainWindow::refreshUsage()
                                 .arg(quotaGb, 0, 'f', quotaGb < 10.0 ? 2 : 0));
     m_usageBar->setProgress(total / quota);
 
+    m_usageSplitDown->setText(formatBytes(double(m_usage->cycleDownBytes())));
+    m_usageSplitUp->setText(formatBytes(double(m_usage->cycleUpBytes())));
+    const QDate start = settings.usage.cycleStart.isValid()
+                            ? settings.usage.cycleStart : QDate::currentDate();
+    const int elapsed = qMax(1, int(start.daysTo(QDate::currentDate())) + 1);
+    const int length = qMax(elapsed, int(start.daysTo(m_usage->cycleEnd(settings.usage))) + 1);
+    if (elapsed >= 2 && total > 0.0) {
+        m_usageProjection->setText(
+            QStringLiteral("At this rate: %1 by %2 \u00b7 %3 per day")
+                .arg(formatBytes(total / elapsed * length),
+                     m_usage->cycleEnd(settings.usage).toString(QStringLiteral("MMM d")),
+                     formatBytes(total / elapsed)));
+    } else {
+        m_usageProjection->setText(
+            QStringLiteral("At this rate: a projection appears after a full day of the cycle"));
+    }
+
     const int days = m_usage->daysUntilReset(settings.usage);
     const QDate end = m_usage->cycleEnd(settings.usage);
     m_usageReset->setText(QStringLiteral("Resets in: %1 Day%2 (%3)")
@@ -3212,36 +3229,15 @@ void MainWindow::onThroughput(double downBps, double upBps)
 
     m_graph->addSample(downBps, upBps);
 
-    // SpeedMonitor samples once per second, so one second of traffic at N
-    // bytes/sec is exactly N bytes of usage.
-    m_usage->addSample(downBps, upBps);
-
-    // Per-application usage history, recorded from the same tick.
-    //
-    // The monitor already attributes bytes to applications for the live panel, and
-    // those bytes are what the system-wide total above is made of. Recording them
-    // here means the Statistics page can answer "how much has Steam used this cycle"
-    // from the same measurement the live table shows, rather than estimating.
-    //
-    // Only while the panel has ever been opened, because that is when the monitor
-    // runs: with no attribution running there is nothing per-app to record, and the
-    // system-wide total still accumulates normally.
-    if (m_appMonitor && m_appMonitor->isRunning()) {
-        const QVector<AppTraffic> apps = m_appMonitor->snapshot();
-        for (const AppTraffic &a : apps) {
-            const QString path = a.executablePath.isEmpty() ? a.executableName
-                                                            : a.executablePath;
-            if (path.isEmpty())
-                continue;
-            m_usage->addAppSample(path,
-                                  a.displayName.isEmpty() ? a.executableName : a.displayName,
-                                  a.bytesIn, a.bytesOut);
-        }
-    }
+    // The sampling interval can drift; the adapter's exact byte deltas remain
+    // authoritative for quota totals regardless of how long the tick took.
+    m_usage->addSample(m_monitor->lastDownBytes(), m_monitor->lastUpBytes());
 }
 
 void MainWindow::onUsageChanged()
 {
+    if (m_appPanel && m_appPanel->isAnimating())
+        return; // counters stay live; revealFinished refreshes the labels later
     refreshUsage();
 }
 

@@ -83,7 +83,7 @@ Write-Host '==> building test_appmon' -ForegroundColor Cyan
     "-I$root\src" "-I$root\third_party\WinDivert\WinDivert-2.2.2-A\include" `
     "-I$qt\include" "-I$qt\include\QtCore" "-I$qt\include\QtGui" "-I$qt\include\QtWidgets" "-I$qt\include\QtSvg" "-I$qt\include\QtNetwork" `
     "-I$qt\mkspecs\win32-g++" `
-    @sources -o $exe "-L$qt\lib" -ladvapi32 -ldwmapi -ltdh -lwintrust -lcrypt32 -lQt6Svg -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network "-L$winder" -lwindivert `
+    @sources -o $exe "-L$qt\lib" -ladvapi32 -ldwmapi -ltdh -lwintrust -lcrypt32 -lwinmm -lQt6Svg -lQt6Widgets -lQt6Gui -lQt6Core -lQt6Network "-L$winder" -lwindivert `
     -liphlpapi -lws2_32 -lshell32 -lmingw32
 if ($LASTEXITCODE -ne 0) { throw 'test_appmon failed to compile' }
 

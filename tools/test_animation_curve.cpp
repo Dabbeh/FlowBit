@@ -50,10 +50,9 @@ void check(bool ok, const QString &what)
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+    app.setQuitOnLastWindowClosed(false);
     theme::setMode(theme::Mode::Dark);
     theme::applyApplicationTheme();
-
-    timeBeginPeriod(1);
 
     AppMonitor monitor;
 
@@ -81,6 +80,17 @@ int main(int argc, char *argv[])
     auto *panel = new AppActivityPanel(&monitor, canvas);
     cl->addWidget(panel);
 
+    // The real dashboard keeps monitoring while collapsed, so Show More often
+    // opens onto a populated table. This catches a reveal target measured from
+    // the stale empty state followed by a one frame correction to the table.
+    monitor.forceRunningForTesting();
+    for (quint32 i = 0; i < 6; ++i)
+        monitor.injectForTesting(7000 + i,
+                                 QStringLiteral("C:/apps/app%1.exe").arg(i),
+                                 2u * 1024 * 1024 - i * 1024,
+                                 256u * 1024 + i * 512);
+    monitor.flushForTesting(1.0);
+
     auto *below = new QWidget(canvas);
     below->setMinimumHeight(400);
     cl->addWidget(below);
@@ -92,23 +102,22 @@ int main(int argc, char *argv[])
     std::vector<Sample> samples;
     QElapsedTimer clock;
 
-    auto *sampler = new QTimer(win);
-    sampler->setTimerType(Qt::PreciseTimer);
-    sampler->setInterval(2);
-    QObject::connect(sampler, &QTimer::timeout, win, [&] {
-        samples.push_back({clock.elapsed(), panel->height(),
-                           panel->mapTo(canvas, QPoint(0, 0)).x(),
-                           panel->mapTo(canvas, QPoint(0, 0)).y()});
+    // Observe production animation ticks. A fast sampling timer or a test-only
+    // timeBeginPeriod call would change the timer behavior being measured.
+    QObject::connect(panel, &AppActivityPanel::revealTick, win, [&](int) {
+        QTimer::singleShot(0, win, [&] {
+            samples.push_back({clock.elapsed(), panel->height(),
+                               panel->mapTo(canvas, QPoint(0, 0)).x(),
+                               panel->mapTo(canvas, QPoint(0, 0)).y()});
+        });
     });
 
     QTimer::singleShot(80, win, [&] {
         clock.start();
-        sampler->start();
         panel->setExpanded(true);
     });
 
     QTimer::singleShot(1200, win, [&] {
-        sampler->stop();
 
         const int startH = samples.empty() ? 0 : samples.front().height;
         const int endH = samples.empty() ? 0 : samples.back().height;
@@ -121,21 +130,21 @@ int main(int argc, char *argv[])
         // tail would drown the motion in zeros; the curve question is about the
         // motion, and the movement invariants are measured across ALL samples below.
         std::vector<int> deltas;
+        std::vector<qint64> frameGaps;
         int maxX = 0, maxTop = 0;
         qint64 motionEnd = 0;
         for (size_t i = 1; i < samples.size(); ++i) {
             maxX = std::max(maxX, std::abs(samples[i].x - samples[i - 1].x));
             maxTop = std::max(maxTop, std::abs(samples[i].topY - samples[i - 1].topY));
-            if (samples[i].ms < 80)
-                continue;   // before the toggle
             const int d = samples[i].height - samples[i - 1].height;
             if (d != 0) {
                 deltas.push_back(d);
+                frameGaps.push_back(samples[i].ms - samples[i - 1].ms);
                 motionEnd = samples[i].ms;
             }
         }
         std::printf("  motion spans %lld ms of the sampled window\n",
-                    static_cast<long long>(motionEnd - 80));
+                    static_cast<long long>(motionEnd));
 
         check(!deltas.empty(), "the reveal produced samples");
         if (deltas.empty()) {
@@ -146,15 +155,21 @@ int main(int argc, char *argv[])
         const int maxStep = *std::max_element(deltas.begin(), deltas.end());
         const int minStep = *std::min_element(deltas.begin(), deltas.end());
         std::printf("  largest single-frame step: %d px\n", maxStep);
+        std::sort(frameGaps.begin(), frameGaps.end());
+        std::printf("  production timer gaps: median %lld ms, worst %lld ms\n",
+                    static_cast<long long>(frameGaps[frameGaps.size() / 2]),
+                    static_cast<long long>(frameGaps.back()));
+        check(frameGaps[frameGaps.size() / 2] < 14,
+              "the reveal updates more frequently than the old 16 ms animation tick");
 
         // 1. monotonic while moving: the growing sequence never reverses. A negative
         //    step here would be the panel shrinking mid-reveal.
-        //
-        //    The panel does apply one discrete correction once the reveal settles
-        //    (pinning the final content height); that lands AFTER the motion window
-        //    and is not part of the curve, so it is excluded by construction - the
-        //    deltas above only collect frames in which the height changed.
         check(minStep >= 0, "the reveal is monotonic (never shrinks mid-expand)");
+
+        check(maxStep < std::max(30, travel / 2),
+              QStringLiteral("a populated table does not cause a large end-of-reveal jump "
+                             "(largest step %1px of %2px)")
+                  .arg(maxStep).arg(travel));
 
         // 2. zero-velocity start: the opening frames must move less than the middle.
         //    Compare the average of the first few steps with the peak step.
@@ -205,7 +220,6 @@ int main(int argc, char *argv[])
     QTimer::singleShot(1600, win, [&] {
         std::printf("\n%s\n", g_failures == 0 ? "test_animation_curve passed."
                                               : "test_animation_curve FAILED.");
-        timeEndPeriod(1);
         app.exit(g_failures == 0 ? 0 : 1);
     });
 

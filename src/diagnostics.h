@@ -39,8 +39,9 @@ struct DiagnosticReport {
     QString toText() const;
 };
 
-// Collects every reading. Does not modify anything and needs no privileges: it
-// reads state rather than changing it, which is what makes it safe to run.
+// Collects readings without changing service configuration. The driver probe
+// never installs a driver or intercepts traffic; verifying access requires
+// elevation, which is reported separately when unavailable.
 //
 // `wantElevated` reports whether the current process holds Administrator rights.
 // Passed in rather than queried here so the report has one consistent view of the

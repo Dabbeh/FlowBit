@@ -23,6 +23,10 @@ $moc = 'C:\Qt\6.10.0\mingw_64\bin\moc.exe'
 $gpp = 'C:\Qt\Tools\mingw1310_64\bin\g++.exe'
 $qtInc = 'C:\Qt\6.10.0\mingw_64\include'
 $qtLib = 'C:\Qt\6.10.0\mingw_64\lib'
+$qtBin = 'C:\Qt\6.10.0\mingw_64\bin'
+$mingwBin = 'C:\Qt\Tools\mingw1310_64\bin'
+$env:Path = "$mingwBin;$qtBin;$env:Path"
+$env:QT_QPA_PLATFORM = 'offscreen'
 
 foreach ($h in @('appactivitypanel.h', 'appmonitor.h', 'busydots.h')) {
     & $moc "-I$srcRoot\src" "-I$qtInc" "$srcRoot\src\$h" -o (Join-Path $outDir ("moc_" + ($h -replace '\.h$', '.cpp')))
@@ -32,6 +36,7 @@ $sources = @(
     "$srcRoot\tools\test_animation_curve.cpp",
     "$srcRoot\src\appactivitypanel.cpp",
     "$srcRoot\src\appmonitor.cpp",
+    "$srcRoot\src\etwclass.cpp",
     "$srcRoot\src\appnames.cpp",
     "$srcRoot\src\theme.cpp",
     "$srcRoot\src\checkmark.cpp",
@@ -52,19 +57,23 @@ $exe = Join-Path $outDir 'test_animation_curve.exe'
     "-L$srcRoot\third_party\WinDivert\WinDivert-2.2.2-A\x64" `
     -lwindivert -ladvapi32 -ldwmapi -ltdh -liphlpapi -lws2_32 -lpsapi -lwinmm `
     -o $exe
+if ($LASTEXITCODE -ne 0) { throw 'test_animation_curve failed to compile' }
 
 if (-not (Test-Path $exe)) { Write-Host "test_animation_curve failed to compile"; exit 1 }
 
-# Run beside the deployed Qt DLLs; a bare exe in build\tests cannot resolve them.
-$appDir = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Flowbit'
-if (Test-Path (Join-Path $appDir 'Qt6Core.dll')) {
-    $staged = Join-Path $appDir 'test_animation_curve.exe'
-    Copy-Item $exe $staged -Force
-    & $staged
-    $rc = $LASTEXITCODE
-    Remove-Item $staged -Force -ErrorAction SilentlyContinue
-    exit $rc
+# Stage Qt's offscreen runtime beside the executable so the test is repeatable
+# and never opens a visible window.
+foreach ($dll in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll')) {
+    Copy-Item (Join-Path $qtBin $dll) $outDir -Force
 }
+foreach ($dll in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
+    Copy-Item (Join-Path $mingwBin $dll) $outDir -Force
+}
+$platformDir = Join-Path $outDir 'platforms'
+New-Item -ItemType Directory -Force -Path $platformDir | Out-Null
+Copy-Item 'C:\Qt\6.10.0\mingw_64\plugins\platforms\qoffscreen.dll' $platformDir -Force
+Copy-Item (Join-Path $srcRoot 'third_party\WinDivert\WinDivert-2.2.2-A\x64\WinDivert.dll') $outDir -Force
 
-& $exe
-exit $LASTEXITCODE
+Push-Location $outDir
+try { & $exe; $rc = $LASTEXITCODE } finally { Pop-Location }
+exit $rc

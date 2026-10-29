@@ -228,10 +228,6 @@ private:
     void setLimiterInputsEnabled(bool enabled);
 
     Settings collect() const;
-    // One eased viewport glide for the dashboard. Used by the Show More/Show Less
-    // flow AFTER the panel tween has finished, so the target is computed against
-    // the final scroll range. Replaces any glide still in flight.
-    void glideDashboardScrollTo(int target, int milliseconds);
 
     void persistAndApply();
     void refreshStatus();
@@ -279,6 +275,9 @@ private:
     // -- zone 2: usage ------------------------------------------------------
     QLabel *m_usageReading = nullptr;
     QLabel *m_usageReset = nullptr;
+    QLabel *m_usageSplitDown = nullptr;
+    QLabel *m_usageSplitUp = nullptr;
+    QLabel *m_usageProjection = nullptr;
     SegmentedBar *m_usageBar = nullptr;
     QDoubleSpinBox *m_quotaSpin = nullptr;
 
@@ -400,12 +399,8 @@ private:
     AppMonitor *m_appMonitor = nullptr;
     AppActivityPanel *m_appPanel = nullptr;
     QPushButton *m_showMoreButton = nullptr;
-    // The dashboard's scroll container. Used to walk the viewport down to the
-    // application activity panel when Show More expands it below the fold.
+    // The dashboard viewport, anchored while application activity expands.
     QScrollArea *m_dashScroll = nullptr;
-    // Smooth scroll to the revealed panel (an instant jump used to mask
-    // the reveal animation entirely).
-    QPropertyAnimation *m_dashScrollAnim = nullptr;
 
     // Drives the panel's value refresh while it is expanded.
     QTimer *m_appRefreshTimer = nullptr;

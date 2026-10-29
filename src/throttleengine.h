@@ -146,24 +146,19 @@ public:
     // conversion happens here and a caller cannot accidentally pass KB/s.
     // What the driver service looked like when startup checked it.
     enum class DriverReadiness {
-        Ready,          // startable; nothing needed doing
+        Ready,          // usable now, or startable on demand
         Repaired,       // it had been left disabled, and the start type was restored
         Held,           // another instance is holding it; it will be fine once that exits
-        NeedsRestart,   // marked for deletion; only a reboot clears that
+        NeedsRestart,   // an unusable service could not be recovered
         Unavailable,    // no service, or one belonging to a different application
     };
 
     // Called once at startup, before the first apply.
     //
-    // The disabled-and-loaded state (START_TYPE 4, STATE 4) is invisible to an open that
-    // succeeds against the already-loaded driver, and only bites at the NEXT load - after a
-    // reboot, or when the last handle closes. Repairing during launch turns a visible
-    // failure-then-recovery into a brief delay with nothing shown.
-    //
-    // Cheap: one registry read and, only when needed, one service config change. Safe to
-    // call from the UI thread, and it does not touch the driver when it is already usable.
-    // Brings the driver into a usable state: registers a missing service, repairs a disabled
-    // one, and clears a pending-deletion deadlock where the machine allows it.
+    // First probes the loaded driver without installing or intercepting traffic.
+    // WinDivert's normal temporary service may read DISABLED/pending deletion;
+    // a successful probe prevents that state from triggering a needless repair.
+    // Only an unavailable driver goes through registration or service recovery.
     //
     // Static, because it is a property of the installation rather than of an engine instance -
     // it touches no member state. That is what lets the application-limiter, which owns its own

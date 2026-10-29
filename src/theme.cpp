@@ -365,7 +365,7 @@ QLabel#cardTitle {
 
 /* ---- text roles ------------------------------------------------------ */
 QLabel#hint   { color: %(muted)s; }
-QLabel#sub    { color: %(secondary)s; font-size: 8pt; }
+QLabel#sub, QLabel#usageProjection { color: %(secondary)s; font-size: 8pt; }
 QLabel#error  { color: %(red)s; font-weight: 600; }
 
 /* The strip the error sits in.

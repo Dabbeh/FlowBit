@@ -277,6 +277,9 @@ AppLimiterPage::AppLimiterPage(AppLimitEngine *engine, QWidget *parent)
     m_emptyState->setWordWrap(true);
     root->addWidget(m_emptyState, 1);
 
+    if (m_engine)
+        connect(m_engine, &AppLimitEngine::stateChanged, this, &AppLimiterPage::refresh);
+
     refresh();
 }
 

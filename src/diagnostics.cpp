@@ -24,6 +24,8 @@
 
 #include <vector>
 
+#include "driverprobe.h"
+
 namespace net {
 
 namespace {
@@ -80,8 +82,10 @@ DWORD readServiceDword(HKEY root, const wchar_t *subkey, const wchar_t *name, DW
 
 struct ServiceState {
     bool present = false;
-    DWORD startType = 0;      // 2 auto, 3 demand, 4 disabled
+    DWORD startType = MAXDWORD;
+    bool statusKnown = false;
     bool running = false;
+    bool deletePending = false;
     QString imagePath;
 };
 
@@ -90,38 +94,46 @@ ServiceState queryWinDivertService()
     ServiceState s;
 
     SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!scm)
-        return s;
-
-    SC_HANDLE svc = OpenServiceW(scm, L"WinDivert", SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS);
-    if (svc) {
-        s.present = true;
-
-        DWORD needed = 0;
-        QueryServiceConfigW(svc, nullptr, 0, &needed);
-        if (needed > 0) {
-            std::vector<BYTE> buf(needed);
-            auto *cfg = reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buf.data());
-            if (QueryServiceConfigW(svc, cfg, needed, &needed)) {
-                s.startType = cfg->dwStartType;
-                s.imagePath = wideToQ(cfg->lpBinaryPathName);
+    if (scm) {
+        if (SC_HANDLE svc = OpenServiceW(scm, L"WinDivert", SERVICE_QUERY_CONFIG)) {
+            s.present = true;
+            DWORD needed = 0;
+            QueryServiceConfigW(svc, nullptr, 0, &needed);
+            if (needed > 0) {
+                std::vector<BYTE> buf(needed);
+                auto *cfg = reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buf.data());
+                if (QueryServiceConfigW(svc, cfg, needed, &needed)) {
+                    s.startType = cfg->dwStartType;
+                    s.imagePath = wideToQ(cfg->lpBinaryPathName);
+                }
             }
+            CloseServiceHandle(svc);
         }
 
-        SERVICE_STATUS status{};
-        if (QueryServiceStatus(svc, &status))
-            s.running = status.dwCurrentState == SERVICE_RUNNING;
-
-        CloseServiceHandle(svc);
+        if (SC_HANDLE svc = OpenServiceW(scm, L"WinDivert", SERVICE_QUERY_STATUS)) {
+            s.present = true;
+            SERVICE_STATUS status{};
+            if (QueryServiceStatus(svc, &status)) {
+                s.statusKnown = true;
+                s.running = status.dwCurrentState == SERVICE_RUNNING;
+            }
+            CloseServiceHandle(svc);
+        }
+        CloseServiceHandle(scm);
     }
-    CloseServiceHandle(scm);
 
-    // The registry value is authoritative for what Windows will do on next start,
-    // so it is read too rather than inferred from the config query.
-    if (s.present) {
+    // OpenService may refuse a service already marked for deletion. Its registry
+    // entry still lets us report the actual registration rather than "missing".
+    constexpr auto keyPath = L"SYSTEM\\CurrentControlSet\\Services\\WinDivert";
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        s.present = true;
         s.startType = readServiceDword(HKEY_LOCAL_MACHINE,
-                                       L"SYSTEM\\CurrentControlSet\\Services\\WinDivert", L"Start",
-                                       s.startType);
+                                      keyPath, L"Start", s.startType);
+        s.deletePending = readServiceDword(HKEY_LOCAL_MACHINE, keyPath, L"DeleteFlag", 0) != 0;
+        if (s.imagePath.isEmpty())
+            s.imagePath = readServiceString(HKEY_LOCAL_MACHINE, keyPath, L"ImagePath");
     }
     return s;
 }
@@ -400,65 +412,76 @@ DiagnosticReport collectDiagnostics(bool isElevated, const QString &monitorError
     }
 
     // ---- driver service ---------------------------------------------------
-    const ServiceState svc = queryWinDivertService();
+    ServiceState svc = queryWinDivertService();
+    const LoadedDriverProbe driverProbe = probeLoadedDriver();
+    if (driverProbe.available) {
+        svc.present = true;
+        svc.statusKnown = true;
+        svc.running = true;
+    }
+
+    add(QStringLiteral("Driver service"), QStringLiteral("Driver access"),
+        driverProbe.available ? QStringLiteral("available")
+                              : QStringLiteral("not verified (error %1)").arg(driverProbe.error),
+        driverProbe.available ? DiagnosticItem::Status::Ok
+                              : ((isElevated && driverProbe.error != ERROR_SERVICE_DOES_NOT_EXIST)
+                                     ? DiagnosticItem::Status::Problem : DiagnosticItem::Status::Info),
+        driverProbe.available
+            ? QStringLiteral("Successfully opened the loaded driver without intercepting "
+                             "traffic or changing its service registration.")
+            : QStringLiteral("This check does not load or install a driver. Flowbit opens "
+                             "it on demand when applying limits; administrator rights "
+                             "are required."));
 
     if (!svc.present) {
         add(QStringLiteral("Driver service"), QStringLiteral("WinDivert service"),
-            QStringLiteral("not registered"), DiagnosticItem::Status::Problem,
-            QStringLiteral(
-                "The driver service is not present. Flowbit registers it during installation, "
-                "and again on launch if it is found missing, so this means both attempts were "
-                "refused. Registering a driver requires administrator rights: run Flowbit as "
-                "Administrator once, from the folder it is installed in, and check this report "
-                "again. If it still fails, a security product may be blocking the driver."));
+            QStringLiteral("not registered (created on demand)"), DiagnosticItem::Status::Info,
+            QStringLiteral("WinDivert creates a temporary service when its driver is first "
+                           "needed and removes it during cleanup. An absent registration "
+                           "alone does not mean the driver is broken."));
     } else {
         const bool disabled = svc.startType == 4;
         add(QStringLiteral("Driver service"), QStringLiteral("Registered"),
             QStringLiteral("yes"), DiagnosticItem::Status::Info);
 
-        // Whether the driver is usable RIGHT NOW is a separate question from its start
-        // type. A resident instance from an earlier session keeps working even when the
-        // service is flagged disabled, so the start type alone must not be reported as
-        // a fault - measured: the driver opened with the engine's own filters while the
-        // service read DISABLED.
-        const bool loaded = svc.running;
-        const bool blocked = disabled && !loaded;
+        // WinDivert 2.2.2 calls DeleteService after starting its driver. Start=4
+        // with DeleteFlag=1 is expected while that temporary driver remains usable.
+        const bool temporary = svc.deletePending && driverProbe.available;
+        DiagnosticItem::Status startStatus = svc.startType == MAXDWORD
+            ? DiagnosticItem::Status::Info : DiagnosticItem::Status::Ok;
+        QString startDetail;
+        if (temporary) {
+            startDetail = QStringLiteral(
+                "WinDivert deliberately marks its temporary service for deletion after "
+                "loading. Windows can display DISABLED during this cleanup state, but "
+                "the driver access check succeeded. This is normal: WinDivert creates "
+                "the service again when needed after a reboot. No repair is required.");
+        } else if (disabled) {
+            startStatus = !driverProbe.available && isElevated
+                ? DiagnosticItem::Status::Problem : DiagnosticItem::Status::Warning;
+            startDetail = driverProbe.available
+                ? QStringLiteral("The driver is available now, but its service is disabled "
+                                 "without WinDivert's normal cleanup flag. Flowbit attempts "
+                                 "recovery if a later request to open the driver fails.")
+                : QStringLiteral("The service is disabled and driver access could not be "
+                                 "verified. Run Flowbit as Administrator and apply a limit "
+                                 "to retry driver recovery. A disabled registration alone "
+                                 "does not establish that a Windows restart is required.");
+        }
 
         add(QStringLiteral("Driver service"), QStringLiteral("Start type"),
-            describeStartType(svc.startType),
-            blocked ? DiagnosticItem::Status::Problem
-                    : (disabled ? DiagnosticItem::Status::Warning
-                                : DiagnosticItem::Status::Ok),
-            disabled ? (loaded
-                            ? QStringLiteral(
-                                  "The service is registered but set not to start. The "
-                                  "driver is loaded and working now, so limits apply - "
-                                  "but after a restart Windows will refuse to load it "
-                                  "until the start type is restored.\n\n"
-                                  "This is what an update leaves behind, because Windows "
-                                  "disables a kernel service whose driver file is "
-                                  "replaced underneath it. Flowbit repairs it "
-                                  "automatically the next time a limit is applied.")
-                            : QStringLiteral(
-                                  "The service is set not to start and the driver is not "
-                                  "loaded, so limits cannot be applied. This is what an "
-                                  "update leaves behind: Windows disables a kernel "
-                                  "service whose driver file is replaced underneath "
-                                  "it.\n\n"
-                                  "Flowbit repairs this automatically when a limit is "
-                                  "applied. If it does not, run this in an "
-                                  "Administrator Command Prompt and restart Flowbit:\n"
-                                  "    sc config WinDivert start= demand"))
-                     : QString());
+            temporary && disabled ? QStringLiteral("DISABLED (expected cleanup)")
+                                  : (svc.startType == MAXDWORD ? QStringLiteral("unknown")
+                                                              : describeStartType(svc.startType)),
+            startStatus, startDetail);
 
         add(QStringLiteral("Driver service"), QStringLiteral("Currently loaded"),
-            svc.running ? QStringLiteral("yes") : QStringLiteral("no"),
+            svc.running ? QStringLiteral("yes")
+                        : (svc.statusKnown ? QStringLiteral("no") : QStringLiteral("unknown")),
             DiagnosticItem::Status::Info,
-            (svc.running && disabled)
-                ? QStringLiteral(
-                      "The driver is still resident in the kernel from an earlier "
-                      "session, which is why it can read as loaded while new requests "
-                      "to open it still fail. A restart clears it.")
+            temporary
+                ? QStringLiteral("The driver is loaded and accepts new handles. Its "
+                                 "temporary service registration does not prevent limits.")
                 : QString());
 
         if (!svc.imagePath.isEmpty()) {

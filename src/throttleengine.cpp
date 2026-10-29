@@ -1,6 +1,8 @@
 #include "throttleengine.h"
 
+#include <QCoreApplication>
 #include <QDebug>
+#include <QDir>
 #include <QString>
 
 #include <windows.h>
@@ -9,6 +11,8 @@
 #include <algorithm>
 #include <chrono>
 #include <vector>
+
+#include "driverprobe.h"
 
 namespace net {
 
@@ -191,13 +195,14 @@ bool servicePointsAtOurDriver()
             std::vector<BYTE> buf(needed);
             auto *cfg = reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(buf.data());
             if (QueryServiceConfigW(svc, cfg, needed, &needed) && cfg->lpBinaryPathName) {
-                // The driver path is registered as \??\C:\...\WinDivert64.sys; compare
-                // only the file name, which is what identifies our driver regardless of
-                // how the path is written.
                 QString path = QString::fromWCharArray(cfg->lpBinaryPathName);
-                path.replace(QLatin1Char('\\'), QLatin1Char('/'));
-                matches = path.endsWith(QLatin1String("WinDivert64.sys"), Qt::CaseInsensitive)
-                          || path.endsWith(QLatin1String("WinDivert32.sys"), Qt::CaseInsensitive);
+                if (path.startsWith(QLatin1String("\\??\\")))
+                    path.remove(0, 4);
+                path = QDir::cleanPath(QDir::fromNativeSeparators(path));
+                const QString ours = QDir(QCoreApplication::applicationDirPath()).filePath(
+                    sizeof(void *) == 8 ? QStringLiteral("WinDivert64.sys")
+                                       : QStringLiteral("WinDivert32.sys"));
+                matches = path.compare(QDir::cleanPath(ours), Qt::CaseInsensitive) == 0;
             }
         }
         CloseServiceHandle(svc);
@@ -430,6 +435,12 @@ bool ThrottleEngine::registerDriverService()
 
 ThrottleEngine::DriverReadiness ThrottleEngine::ensureDriverReady()
 {
+    // WinDivert intentionally marks its temporary service for deletion after
+    // loading. A usable driver needs no repair, even if Windows reports Start=4.
+    // In particular, do not stop a healthy driver used by application limits.
+    if (probeLoadedDriver().available)
+        return DriverReadiness::Ready;
+
     const DriverServiceState state = readDriverServiceState();
 
     if (!state.exists) {

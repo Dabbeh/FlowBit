@@ -17,7 +17,6 @@
 #include <QCoreApplication>
 #include <QDate>
 #include <QDir>
-#include <QTemporaryDir>
 #include <QTextStream>
 
 using namespace net;
@@ -44,9 +43,11 @@ int main(int argc, char *argv[])
     QCoreApplication app(argc, argv);
     QTextStream out(stdout);
 
-    QTemporaryDir dir;
-    if (!dir.isValid()) {
-        out << "could not create a temporary directory\n";
+    const QString scratch = QDir(QCoreApplication::applicationDirPath())
+                                .filePath(QStringLiteral("app_usage_scratch"));
+    QDir(scratch).removeRecursively();
+    if (!QDir().mkpath(scratch)) {
+        out << "could not create the test data directory\n";
         return 1;
     }
 
@@ -58,7 +59,7 @@ int main(int argc, char *argv[])
     out << "== per-application usage history ==\n";
     {
         UsageTracker t;
-        t.setDataDirectory(dir.path());
+        t.setDataDirectory(scratch);
         t.load(config);
 
         // Nothing recorded yet.
@@ -114,7 +115,7 @@ int main(int argc, char *argv[])
 
         // The files must exist and be readable.
         const QString appsFile = QStringLiteral("%1/apps-%2.json")
-                                     .arg(dir.path(),
+                                     .arg(scratch,
                                           QDate::currentDate().toString(QStringLiteral("yyyy-MM")));
         check(QFile::exists(appsFile),
               QStringLiteral("per-app history was written to %1")
@@ -126,7 +127,7 @@ int main(int argc, char *argv[])
         // Print what was written and what came back, so any failure here names its
         // own cause instead of being inferred from a boolean.
         const QString appsFile = QStringLiteral("%1/apps-%2.json")
-                                     .arg(dir.path(),
+                                     .arg(scratch,
                                           QDate::currentDate().toString(QStringLiteral("yyyy-MM")));
         if (QFile::exists(appsFile)) {
             QFile f(appsFile);
@@ -139,7 +140,7 @@ int main(int argc, char *argv[])
 
         // A fresh tracker reading the same directory must see what was written.
         UsageTracker t2;
-        t2.setDataDirectory(dir.path());
+        t2.setDataDirectory(scratch);
         t2.load(config);
 
         for (const UsageTracker::AppUsage &a : t2.appUsageOverDays(30)) {
@@ -167,7 +168,7 @@ int main(int argc, char *argv[])
     out << "\n== pruning ==\n";
     {
         UsageTracker t3;
-        t3.setDataDirectory(dir.path());
+        t3.setDataDirectory(scratch);
         t3.load(config);
 
         // Keep one day: today's entries stay, and the call must not throw away the
@@ -180,6 +181,8 @@ int main(int argc, char *argv[])
         check(t3.appUsageOverDays(30).isEmpty(),
               "pruning with no days retained clears the history");
     }
+
+    QDir(scratch).removeRecursively();
 
     out << "\n" << g_checks << " checks, " << g_failures << " failures\n";
     out << (g_failures == 0 ? "test_app_usage passed.\n" : "test_app_usage FAILED.\n");

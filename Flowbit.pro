@@ -56,6 +56,7 @@ LIBS += -ladvapi32 -ltdh
 # WinVerifyTrust, used by the diagnostics report to check the driver signature.
 LIBS += -lwintrust -lcrypt32
 LIBS += -ldwmapi
+LIBS += -lwinmm
 
 SOURCES += \
     src/main.cpp \
@@ -101,6 +102,7 @@ SOURCES += \
 HEADERS += \
     src/selftest.h \
     src/throttleengine.h \
+    src/driverprobe.h \
     src/settings.h \
     src/schedule.h \
     src/settingsstore.h \

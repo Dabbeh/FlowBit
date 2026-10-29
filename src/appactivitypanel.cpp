@@ -6,24 +6,23 @@
 
 #include <QFrame>
 #include <QEasingCurve>
-#include <QGraphicsOpacityEffect>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QScrollBar>
 #include <QLabel>
-#include <QParallelAnimationGroup>
-#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QSet>
+#include <QScreen>
+#include <QStackedWidget>
 #include <QTableWidget>
-#include <QDebug>
 #include <QTimer>
-#include <QVariantAnimation>
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <windows.h>
+#include <mmsystem.h>
 
 namespace net {
 
@@ -32,6 +31,7 @@ namespace {
 // The narrowest a numeric column may be squeezed. Below this a rate is unreadable even elided,
 // so it is a floor for legibility rather than for the arithmetic.
 constexpr int kMinColumnWidth = 56;
+constexpr int kRevealDurationMs = 360;
 
 // Rates are rendered with the app's existing formatting rules, so the units here
 // match the Live Speed readout exactly. Bytes, not bits - 1 MB/s is 8 Mbps, but
@@ -56,8 +56,15 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
 {
     setObjectName(QStringLiteral("card"));
     setStyleSheet(theme::cardStyleSheet(QStringLiteral("card")));
+    QSizePolicy policy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+    policy.setRetainSizeWhenHidden(true);
+    setSizePolicy(policy);
+    setFixedHeight(0);
 
-    auto *root = new QVBoxLayout(this);
+    // Keep the table, labels and footer at their full layout size. Only this
+    // frame's clipping height changes during a reveal.
+    m_content = new QWidget(this);
+    auto *root = new QVBoxLayout(m_content);
     root->setContentsMargins(14, 12, 14, 12);
     root->setSpacing(10);
 
@@ -71,6 +78,12 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     header->addStretch(1);
 
     root->addLayout(header);
+
+    // Switching between waiting, error and measured data keeps one stable body
+    // size rather than starting another height change after the reveal ends.
+    m_states = new QStackedWidget(m_content);
+    m_states->setMinimumHeight(180);
+    root->addWidget(m_states, 1);
 
     // -- table -------------------------------------------------------------
     // Column headings take the graph's series colours on the arrows only: the
@@ -134,7 +147,7 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     connect(m_table->horizontalHeader(), &QHeaderView::sectionClicked, this,
             &AppActivityPanel::sortByColumn);
 
-    root->addWidget(m_table, 1);
+    m_states->addWidget(m_table);
 
     // -- empty state -------------------------------------------------------
     m_emptyState = new QWidget(this);
@@ -166,7 +179,7 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     emptyLayout->addWidget(m_busyDots, 0, Qt::AlignHCenter);
     m_busyDots->setVisible(false);
 
-    root->addWidget(m_emptyState);
+    m_states->addWidget(m_emptyState);
 
     // -- error state -------------------------------------------------------
     m_errorState = new QWidget(this);
@@ -195,7 +208,8 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     });
     errLayout->addWidget(m_retryButton, 0, Qt::AlignHCenter);
 
-    root->addWidget(m_errorState);
+    m_states->addWidget(m_errorState);
+    m_states->setCurrentWidget(m_emptyState);
 
     // -- footer ------------------------------------------------------------
     auto *footer = new QHBoxLayout();
@@ -245,77 +259,14 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
 
     root->addLayout(footer);
 
-    // -- expand/collapse tween ----------------------------------------------
-    // Animates the panel's own height through a dedicated property.
-    //
-    // Why not maximumHeight: that invalidates the parent layout on every frame, so
-    // the scroll area re-laid out the whole dashboard canvas ~60 times a second.
-    // The visible result was the page shoving itself around instead of the panel
-    // opening - the reported "it pushes" behaviour.
-    //
-    // animHeight() below sets both minimumHeight and maximumHeight to the same
-    // value, which pins the panel's box and lets the layout below it settle once
-    // when the tween ends rather than on every step.
-    m_expandAnim = new QPropertyAnimation(this, "animHeight", this);
-    // 280ms InOutSine, and the duration is tied to the curve rather than chosen
-    // independently: InOutSine starts at ZERO velocity, so its opening frames cover
-    // very little distance. At 220ms that slow start read as hesitation; 280ms gives
-    // the curve room to accelerate through the middle and settle at the end, and it
-    // is still inside the 200-300ms band these reveals normally use.
-    //
-    // Why this curve: the reveal must read as ONE motion. An ease-out curve
-    // (OutQuad, OutCubic) begins at well above its average speed, so the first
-    // displayed frame is a visible step - measured at ~50px of a 514px travel, which
-    // is what "it pushes" was. Qt's own description of InOutSine is "acceleration
-    // until halfway, then deceleration", which is the shape wanted here.
-    //
-    // Deliberately NOT animated alongside the height:
-    //   * a content fade, which forces an offscreen render of the whole panel (table
-    //     included) every frame - the reported "it lags"
-    //   * a settle offset, a second simultaneous motion - the reported "wobble"
-    // Every extra motion competing for the shared animation timer is one more thing
-    // that can be seen as a separate movement instead of part of the reveal.
-    m_expandAnim->setDuration(280);
-    m_expandAnim->setEasingCurve(QEasingCurve::InOutSine);
-
-    connect(m_expandAnim, &QVariantAnimation::finished, this, [this] {
-        if (!m_expanded) {
-            // Fully collapsed: hide, and release the height constraint so the
-            // widget is never left pinned if it is shown again.
-            setVisible(false);
-            m_animHeight = -1;
-            setMinimumHeight(0);
-            setMaximumHeight(QWIDGETSIZE_MAX);
-
-            // The trace session is deliberately NOT torn down here any more. See the collapse
-            // branch of setExpanded(): the monitor now runs for as long as the application does,
-            // so there is nothing to release when the panel closes.
-        } else {
-            // Fully expanded: KEEP the height pin at the tween's end value.
-            //
-            // Releasing it here used to snap the panel to whatever height the
-            // surrounding layout allocated - often well above the animated target,
-            // so the reveal ended with a one-frame jump that read as the panel
-            // "pushing" at the end of the motion.
-            //
-            // Growing later (new rows appearing) still works: rebuildTable()
-            // raises the pin when the content needs more room.
-        }
-        // The table was skipped during the tween; bring it up to date once. This
-        // also re-measures the height pin against the REAL content - the target used
-        // for the tween was measured against the empty state, which is why the first
-        // open could settle at the wrong height.
-        m_animating = false;
-        refresh();
-        if (m_animHeight >= 0) {
-            const int want = qMax(120, sizeHint().height());
-            if (want != m_animHeight)
-                setAnimHeight(want);
-        }
-        // The tween reached completion: the scroll range is now final, so this is
-        // the first moment a viewport glide can be computed correctly.
-        emit revealFinished();
-    });
+    // The outer frame clips a stable inner layout; its children never compress
+    // into the intermediate heights of the animation.
+    // QWidget property animations normally advance every ~16 ms. A card this
+    // tall then moves more than 20 pixels per update. Give this short reveal
+    // its own precise clock so it also paints smoothly on faster displays.
+    m_revealTimer = new QTimer(this);
+    m_revealTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_revealTimer, &QTimer::timeout, this, &AppActivityPanel::advanceReveal);
 
     // Ranking refresh, deliberately slower than the value refresh.
     m_rankTimer = new QTimer(this);
@@ -329,6 +280,129 @@ AppActivityPanel::AppActivityPanel(AppMonitor *monitor, QWidget *parent)
     setVisible(false);
 }
 
+AppActivityPanel::~AppActivityPanel()
+{
+    m_revealTimer->stop();
+    endPreciseTiming();
+}
+
+void AppActivityPanel::beginPreciseTiming()
+{
+    if (!m_preciseTiming && timeBeginPeriod(1) == TIMERR_NOERROR)
+        m_preciseTiming = true;
+}
+
+void AppActivityPanel::endPreciseTiming()
+{
+    if (m_preciseTiming) {
+        timeEndPeriod(1);
+        m_preciseTiming = false;
+    }
+}
+
+int AppActivityPanel::contentHeight() const
+{
+    return m_contentHeight;
+}
+
+QSize AppActivityPanel::sizeHint() const
+{
+    return QSize(m_content->sizeHint().width(), contentHeight());
+}
+
+QSize AppActivityPanel::minimumSizeHint() const
+{
+    return QSize(m_content->minimumSizeHint().width(), 0);
+}
+
+void AppActivityPanel::layoutContent()
+{
+    const int wrapped = m_content->heightForWidth(width());
+    const int natural = qMax(240, wrapped >= 0 ? wrapped : m_content->sizeHint().height());
+    // Data arriving after a reveal must not make the card bounce smaller.
+    m_contentHeight = m_expanded ? qMax(m_contentHeight, natural) : natural;
+    m_content->setFixedHeight(m_contentHeight);
+    const QRect geometry(0, 0, width(), m_contentHeight);
+    if (m_content->geometry() != geometry)
+        m_content->setGeometry(geometry);
+    m_content->layout()->activate();
+}
+
+void AppActivityPanel::finishReveal()
+{
+    m_revealTimer->stop();
+    endPreciseTiming();
+    m_animating = false;
+    if (!m_expanded) {
+        setAnimHeight(0);
+        hide();
+    }
+    emit revealFinished();
+    if (m_expanded) {
+        QTimer::singleShot(0, this, [this] {
+            if (m_expanded && !m_animating)
+                refresh();
+        });
+    }
+}
+
+void AppActivityPanel::animateToHeight(int target)
+{
+    const int from = qMax(0, m_animHeight >= 0 ? m_animHeight : height());
+    // Reverse the existing timeline when possible. Restarting an easing curve
+    // on each click would insert a pause and discard its current progress.
+    if (m_animated && m_animating && (target == m_revealFrom || target == m_revealTo)) {
+        const int direction = target == m_revealTo ? 1 : -1;
+        if (direction == m_revealDirection)
+            return;
+        m_revealDirection = direction;
+        m_revealClock.restart();
+        emit revealStarted(from, target);
+        return;
+    }
+    m_revealTimer->stop();
+    if (!m_animated || from == target) {
+        const bool settling = m_animating;
+        m_animating = false;
+        endPreciseTiming();
+        setAnimHeight(target);
+        if (!m_expanded) {
+            hide();
+        }
+        if (settling)
+            emit revealFinished();
+        return;
+    }
+    m_animating = true;
+    m_revealFrom = from;
+    m_revealTo = target;
+    m_revealDirection = 1;
+    m_revealTimeMs = 0;
+    m_revealDurationMs = qBound(160, kRevealDurationMs * qAbs(target - from) / contentHeight(),
+                               kRevealDurationMs);
+    emit revealStarted(from, target);
+    // Oversample 60 Hz screens and follow faster screens up to 240 Hz. This
+    // clock is local to the panel and stops completely when the reveal ends.
+    const qreal rate = qBound(120.0, screen() ? screen()->refreshRate() : 120.0, 240.0);
+    beginPreciseTiming();
+    m_revealClock.start();
+    m_revealTimer->start(qMax(4, qRound(1000.0 / rate)));
+}
+
+void AppActivityPanel::advanceReveal()
+{
+    const qreal elapsedMs = m_revealClock.nsecsElapsed() / 1000000.0;
+    m_revealClock.restart();
+    m_revealTimeMs = qBound(0.0, m_revealTimeMs + m_revealDirection * elapsedMs,
+                           qreal(m_revealDurationMs));
+    const qreal progress = QEasingCurve(QEasingCurve::InOutSine)
+                               .valueForProgress(m_revealTimeMs / m_revealDurationMs);
+    setAnimHeight(qRound(m_revealFrom + (m_revealTo - m_revealFrom) * progress));
+    if ((m_revealDirection > 0 && m_revealTimeMs >= m_revealDurationMs)
+        || (m_revealDirection < 0 && m_revealTimeMs <= 0))
+        finishReveal();
+}
+
 void AppActivityPanel::setAnimHeight(int height)
 {
     if (m_animHeight == height)
@@ -338,13 +412,7 @@ void AppActivityPanel::setAnimHeight(int height)
         setMinimumHeight(0);
         setMaximumHeight(QWIDGETSIZE_MAX);
     } else {
-        // Both, deliberately: setting only maximumHeight lets the layout keep
-        // re-flowing, which is the behaviour being fixed here.
-        setMinimumHeight(height);
-        setMaximumHeight(height);
-        // Announce the step so the viewport can follow the growth in the same
-        // frame. Same source, same easing, same instant: the scroll ends up with
-        // the height delta exactly once, which is why the motion reads as one.
+        setFixedHeight(height);
         emit revealTick(height);
     }
 }
@@ -353,110 +421,36 @@ void AppActivityPanel::setExpanded(bool expanded)
 {
     if (m_expanded == expanded)
         return;
-    m_expanded = expanded;
-
-    if (expanded) {
-        // Re-expanding cancels any stop that was queued by the last collapse: the
-        // session is wanted again, and stopping it now would make the panel sit
-        // empty until the next start finished.
-        m_stopMonitorWhenCollapsed = false;
-
-        // Monitoring starts only when the panel is first shown, so a collapsed
-        // dashboard costs nothing. Asynchronous: even a wedged ETW leftover can
-        // hold the bounded cleanup workers, never this panel.
+    // Preserve the current visible extent when reversing a running transition.
+    const int from = isVisible() ? height() : 0;
+    if (expanded && !m_animating) {
         if (m_monitor && !m_monitor->isRunning())
             m_monitor->startAsync();
-
-        setVisible(true);
-        if (m_animated) {
-            // Reveal: the panel's height grows from nothing to its natural size.
-            //
-            // The target must be the height the panel will SETTLE at, or the reveal
-            // travels too far and the correction then snaps back - a step at the end
-            // of the animation.
-            //
-            // Measuring sizeHint() directly is not that number: a widget that is
-            // hidden still contributes to its layout's size hint. Measured while
-            // collapsed, this panel reports 514px because the (hidden) table brings
-            // its 160px minimum and 192px hint with it, yet the same panel settles at
-            // 188px once expanded with no rows to show. That 326px difference was the
-            // end-of-reveal jump.
-            //
-            // updateStateVisibility() is what rebuildTable() uses to decide which
-            // children apply, so applying it first makes sizeHint() describe the
-            // state about to be shown. A floor of 120px keeps a momentarily-empty
-            // panel from collapsing to a sliver mid-reveal.
-            updateStateVisibility();
-            const int target = qMax<int>(120, sizeHint().height());
-
-            m_animating = true;
-            m_expandAnim->stop();
-            m_expandAnim->setStartValue(1);
-            m_expandAnim->setEndValue(target);
-            // Jump straight to the collapsed height so the first frame is already
-            // correct, then animate outwards.
-            setAnimHeight(1);
-
-            m_expandAnim->start();
-        } else {
-            setAnimHeight(-1);
-        }
-    } else {
-        // Collapsing. The trace session is deliberately KEPT.
-        //
-        // It used to be torn down here so a collapsed dashboard held no ETW handles. But the
-        // per-application usage table is filled from the monitor's snapshot, so stopping it
-        // meant usage was recorded only while the panel happened to be open - low by design.
-        //
-        // It is also why Diagnostics could read "ETW events received: 0 (decoded: 0)" on a
-        // busy machine: an administrator sitting in Settings never expands this panel, so the
-        // session never existed. Both readings were true and neither made sense alone.
-        //
-        // The monitor now runs for as long as the application does (MainWindow starts it). The
-        // deferred-stop machinery went with it: it existed only because AppMonitor::stop() is
-        // synchronous and blocked the UI thread for up to a second mid-collapse, which crashed
-        // the app, so it had to be deferred to the end of the animation.
-        m_stopMonitorWhenCollapsed = false;
-
-        if (m_animated) {
-            // Collapse: shrink from the current height back to nothing. Starting
-            // from the measured current height (rather than from the widget's
-            // pinned value) keeps the motion continuous if the user toggles again
-            // while a reveal is still running.
-            //
-            // Collapse is the same single motion in reverse: the height clips the
-            // content away and nothing else moves. There is no fade to retire and no
-            // settle offset to reset - the reveal runs no effects at all.
-            m_animating = true;
-            m_expandAnim->stop();
-            m_expandAnim->setStartValue(qMax(1, height()));
-            m_expandAnim->setEndValue(1);
-            m_expandAnim->start();
-        } else {
-            setVisible(false);
-            setAnimHeight(-1);
-        }
+        refresh();
     }
-
-    refresh();
+    if (expanded) {
+        setAnimHeight(from);
+        // show() delivers any resize event accumulated while the panel was
+        // hidden. Keep the collapsed state until that event has been handled;
+        // otherwise resizeEvent pins the frame to its full height before the
+        // animation even gets its starting value.
+        show();
+        m_expanded = true;
+        if (!m_animating)
+            layoutContent();
+        animateToHeight(contentHeight());
+    } else {
+        m_expanded = false;
+        // Monitoring continues while collapsed so usage accounting stays live.
+        animateToHeight(0);
+    }
     emit expandedChanged(m_expanded);
 }
 
 void AppActivityPanel::refresh()
 {
-    if (!m_monitor)
+    if (!m_monitor || m_animating)
         return;
-
-    // Re-parenting destroys the graphics effect.
-    //
-    // QWidget::setParent() deletes any QGraphicsEffect the widget has, and this
-    // panel IS re-parented: ResponsivePair::embedMiddle()/takeMiddle() move it
-    // between layouts whenever the window crosses the layout breakpoint. The
-    // fading animation kept pointing at the effect that had been deleted, so the
-    // next animation step dereferenced freed memory - the access violation inside
-    // (The panel no longer uses a QGraphicsOpacityEffect: it forced an offscreen
-    // render of the whole subtree - table included - on every animation frame,
-    // which was the stutter. Nothing to recover here now.)
 
     const MonitorState state = m_monitor->state();
 
@@ -464,17 +458,16 @@ void AppActivityPanel::refresh()
     // indistinguishable from "nothing is using the network right now".
     if (state == MonitorState::Unavailable) {
         m_errorText->setText(m_monitor->errorString());
-        m_errorState->setVisible(true);
-        m_table->setVisible(false);
-        m_emptyState->setVisible(false);
+        m_states->setCurrentWidget(m_errorState);
         m_viewAllButton->setVisible(false);
         m_unattributedLabel->clear();
         if (m_scopeNoteLabel)
             m_scopeNoteLabel->setVisible(false);
+        layoutContent();
+        if (m_expanded && isVisible())
+            animateToHeight(contentHeight());
         return;
     }
-
-    m_errorState->setVisible(false);
 
     const QVector<AppTraffic> apps = m_monitor->snapshot();
 
@@ -558,32 +551,29 @@ void AppActivityPanel::refresh()
 
     rebuildTable();
 
-    // Keep the height pin in step with the CONTENT, in both directions.
-    //
-    // Raising only was the bug: the reveal target is measured before any rows exist,
-    // against the empty state, so on the first open the pin could be set too large -
-    // and a guard that only raises can never correct it. The panel then stayed
-    // oversized until a collapse and re-expand re-measured it, which is exactly the
-    // "first time it is very long, fine afterwards" the user reported.
-    //
-    // While the reveal is running the tween owns the height, so corrections are
-    // deferred to it; afterwards the pin tracks the content either way.
-    if (!m_animating && m_animHeight >= 0) {
-        const int want = qMax(120, sizeHint().height());
-        if (want != m_animHeight)
-            setAnimHeight(want);
-    }
+    layoutContent();
+    if (m_expanded && isVisible())
+        animateToHeight(contentHeight());
 }
 
 
 void AppActivityPanel::resizeEvent(QResizeEvent *event)
 {
-    QWidget::resizeEvent(event);
-
-    // The columns divide the available width, so a new width means new widths for them.
-    // Guarded against re-entering: setting a column width triggers a layout pass, and this is
-    // called from the resize that results.
-    refreshColumnWidths();
+    QFrame::resizeEvent(event);
+    // Height-only animation frames never resize or remeasure the table.
+    if (event->size().width() == event->oldSize().width())
+        return;
+    if (m_animating) {
+        layoutContent();
+        refreshColumnWidths();
+        if (m_expanded)
+            animateToHeight(contentHeight());
+    } else {
+        layoutContent();
+        refreshColumnWidths();
+        if (m_expanded)
+            setAnimHeight(contentHeight());
+    }
 }
 
 void AppActivityPanel::showEvent(QShowEvent *event)
@@ -612,14 +602,6 @@ void AppActivityPanel::refreshColumnWidths()
     applyNumericColumnWidths();
     m_adjustingColumns = false;
 
-    // A second pass, because the first may change the layout: a column narrowed below its
-    // content can make the table's own width hint change, and the widths are computed from that
-    // width. Repeating once settles it rather than leaving the first pass's guess in place.
-    if (!m_adjustingColumns && m_table->isVisible()) {
-        m_adjustingColumns = true;
-        applyNumericColumnWidths();
-        m_adjustingColumns = false;
-    }
 }
 
 void AppActivityPanel::applyNumericColumnWidths()
@@ -696,38 +678,11 @@ void AppActivityPanel::applyNumericColumnWidths()
 
 }
 
-void AppActivityPanel::updateStateVisibility()
-{
-    // Make the panel's reported size hint describe the state it is about to show.
-    //
-    // A hidden child still counts toward its layout's size hint, so the collapsed
-    // panel reported a height that included the (hidden) table - 514px against the
-    // 188px it actually settles at. Applying the same visibility rules rebuildTable()
-    // uses, BEFORE measuring, makes the reveal target honest.
-    if (!m_table || !m_emptyState || !m_errorState)
-        return;
-
-    const bool failed = m_monitor && m_monitor->state() == MonitorState::Unavailable;
-    const bool hasRows = !m_ranked.isEmpty();
-
-    m_errorState->setVisible(failed);
-    m_table->setVisible(!failed && hasRows);
-    if (!failed && hasRows) {
-        // The table has just become visible, which is the first moment its width is real.
-        // Deferred, because the layout that gives it that width has not run yet.
-        QTimer::singleShot(0, this, [this] { refreshColumnWidths(); });
-    }
-    m_emptyState->setVisible(!failed && !hasRows);
-    if (m_viewAllButton)
-        m_viewAllButton->setVisible(!failed && hasRows && m_ranked.size() > kTopCount);
-}
-
 void AppActivityPanel::rebuildTable()
 {
     const bool hasRows = !m_ranked.isEmpty();
 
-    m_emptyState->setVisible(!hasRows);
-    m_table->setVisible(hasRows);
+    m_states->setCurrentWidget(hasRows ? static_cast<QWidget *>(m_table) : m_emptyState);
     if (!hasRows) {
         m_viewAllButton->setVisible(false);
         m_unattributedLabel->clear();

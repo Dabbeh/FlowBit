@@ -31,7 +31,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Qt
 # ---------------------------------------------------------------------------
-find_package(Qt6 REQUIRED COMPONENTS Widgets Svg)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
 
 # ---------------------------------------------------------------------------
 # WinDivert (bundled, see third_party/WinDivert)
@@ -57,10 +57,30 @@ add_executable(Flowbit WIN32
     src/main.cpp
     src/brandmark.cpp
     src/brandmark.h
+    src/selftest.cpp
+    src/selftest.h
+    src/autostart.cpp
+    src/autostart.h
+    src/checkmark.cpp
+    src/checkmark.h
+    src/crossticon.cpp
+    src/crossticon.h
+    src/scrollbaranimator.cpp
+    src/scrollbaranimator.h
+    src/updater.cpp
+    src/updater.h
+    src/busydots.cpp
+    src/busydots.h
+    src/navicons.cpp
+    src/navicons.h
+    src/navbutton.cpp
+    src/navbutton.h
+    src/theme.cpp
+    src/theme.h
     src/throttleengine.cpp
     src/throttleengine.h
+    src/driverprobe.h
     src/settings.h
-    src/settings.cpp
     src/schedule.h
     src/schedule.cpp
     src/settingsstore.h
@@ -125,9 +145,9 @@ target_link_directories(Flowbit PRIVATE "${WINDIVERT_ARCH_DIR}")
 target_link_libraries(Flowbit PRIVATE
     Qt6::Widgets
     Qt6::Svg
-    windivert        # WinDivert import library (WinDivert.lib
+    Qt6::Network
+    windivert        # WinDivert import library
     dwmapi
-)
     iphlpapi         # GetIfTable2 for live throughput
     ws2_32
     advapi32         # ETW session control (per-application monitoring)
@@ -137,6 +157,7 @@ target_link_libraries(Flowbit PRIVATE
     psapi
     shell32
     user32
+    winmm            # precise Windows timing during reveal animations
 )
 
 # windres needs to find the .manifest referenced from app.rc

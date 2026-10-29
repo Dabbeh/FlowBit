@@ -15,12 +15,16 @@ $moc = 'C:\Qt\6.10.0\mingw_64\bin\moc.exe'
 $gpp = 'C:\Qt\Tools\mingw1310_64\bin\g++.exe'
 $qtInc = 'C:\Qt\6.10.0\mingw_64\include'
 $qtLib = 'C:\Qt\6.10.0\mingw_64\lib'
+$qtBin = 'C:\Qt\6.10.0\mingw_64\bin'
+$mingwBin = 'C:\Qt\Tools\mingw1310_64\bin'
+$env:Path = "$mingwBin;$qtBin;$env:Path"
 
 & $moc "-I$srcRoot\src" "-I$qtInc" "$srcRoot\src\appmonitor.h" -o (Join-Path $outDir 'moc_appmonitor.cpp')
 
 $sources = @(
     "$srcRoot\tools\test_monitor_fallback.cpp",
     "$srcRoot\src\appmonitor.cpp",
+    "$srcRoot\src\etwclass.cpp",
     "$srcRoot\src\appnames.cpp",
     "$srcRoot\src\theme.cpp",
     "$srcRoot\src\checkmark.cpp",
@@ -36,20 +40,17 @@ $exe = Join-Path $outDir 'test_monitor_fallback.exe'
     "-L$qtLib" -lQt6Widgets -lQt6Gui -lQt6Core `
     -ladvapi32 -ldwmapi -ltdh -liphlpapi -lws2_32 -lpsapi -luser32 -lgdi32 `
     -o $exe
+if ($LASTEXITCODE -ne 0) { throw 'test_monitor_fallback failed to compile' }
 
 if (-not (Test-Path $exe)) { Write-Host "test_monitor_fallback failed to compile"; exit 1 }
 
-# Run beside the deployed Qt DLLs: a bare exe in build\tests cannot resolve them
-# (0xC0000135), which would look like a test failure rather than a missing path.
-$appDir = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Flowbit'
-if (Test-Path (Join-Path $appDir 'Qt6Core.dll')) {
-    $staged = Join-Path $appDir 'test_monitor_fallback.exe'
-    Copy-Item $exe $staged -Force
-    & $staged
-    $rc = $LASTEXITCODE
-    Remove-Item $staged -Force -ErrorAction SilentlyContinue
-    exit $rc
+# Stage Qt's runtime beside the test. Run the test unelevated and in place.
+foreach ($dll in @('Qt6Core.dll', 'Qt6Gui.dll', 'Qt6Widgets.dll')) {
+    Copy-Item (Join-Path $qtBin $dll) $outDir -Force
 }
-
-& $exe
-exit $LASTEXITCODE
+foreach ($dll in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
+    Copy-Item (Join-Path $mingwBin $dll) $outDir -Force
+}
+Push-Location $outDir
+try { & $exe; $rc = $LASTEXITCODE } finally { Pop-Location }
+exit $rc

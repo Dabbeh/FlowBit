@@ -60,10 +60,8 @@ private:
     int m_firstStretch = 1;
     int m_secondStretch = 1;
     int m_threshold = 900;
-    // Cached from the children when the pair is first arranged. Used for the pair's
-    // own minimum height: deriving it from live content hints on every re-layout made
-    // the pair change height while the activity panel animated, which pushed the Live
-    // Speed card (and its graph) up and down.
+    // Shared card height, measured after polishing and held during middle-panel
+    // transitions so the layout cannot resize the graph to redistribute space.
     int m_childHeight = 0;
 
     bool m_stacked = false;

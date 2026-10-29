@@ -25,6 +25,7 @@ Write-Host '==> building test_diagnostics' -ForegroundColor Cyan
     -finput-charset=UTF-8 -fexec-charset=UTF-8 `
     -DNTDDI_VERSION=0x06010000 -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 `
     "-I$root\src" `
+    "-I$root\third_party\WinDivert\WinDivert-2.2.2-A\include" `
     "-I$qt\include" "-I$qt\include\QtCore" "-I$qt\include\QtGui" "-I$qt\include\QtWidgets" `
     "-I$qt\mkspecs\win32-g++" `
     (Join-Path $root 'tools\test_diagnostics.cpp') `
@@ -37,7 +38,8 @@ Write-Host '==> building test_diagnostics' -ForegroundColor Cyan
     (Join-Path $root 'src\units.cpp') `
     (Join-Path $mocOut 'moc_diagnosticspanel.cpp') `
     (Join-Path $mocOut 'moc_appmonitor.cpp') `
-    -o $exe "-L$qt\lib" -lQt6Widgets -lQt6Gui -lQt6Core `
+    -o $exe "-L$qt\lib" "-L$root\third_party\WinDivert\WinDivert-2.2.2-A\x64" `
+    -lQt6Widgets -lQt6Gui -lQt6Core -lwindivert `
     -ladvapi32 -ldwmapi -ltdh -lwintrust -lcrypt32 -liphlpapi -lws2_32 -lmingw32
 if ($LASTEXITCODE -ne 0) { throw 'test_diagnostics failed to compile' }
 

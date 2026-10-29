@@ -1,5 +1,9 @@
 # The WinDivert driver service, and why limits take a moment to start
 
+> Correction (2026-10-23): WinDivert deliberately marks its temporary service for
+> deletion after loading. The disabled/pending-deletion state alone does not
+> establish damage. See [the service lifecycle correction](windivert-service-lifecycle.md).
+
 ## The symptom
 
 Flowbit opens and reports that the driver is not running or that limits are not applying.

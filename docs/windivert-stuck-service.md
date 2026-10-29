@@ -1,5 +1,9 @@
 # The stuck WinDivert service: what it is, and how it is cleared without a reboot
 
+> Correction (2026-10-23): WinDivert deliberately marks its temporary service for
+> deletion after loading. A usable driver in this state needs no repair. See
+> [the service lifecycle correction](windivert-service-lifecycle.md).
+
 ## The state
 
 Found on a real machine, after an update:

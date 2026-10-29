@@ -3,16 +3,16 @@
 #include "appmonitor.h"
 
 #include <QFrame>
+#include <QElapsedTimer>
 #include <QWidget>
 
 class QShowEvent;
 class QResizeEvent;
-
-class QPropertyAnimation;
 class QLabel;
 class QPushButton;
 class QTableWidget;
 class QTimer;
+class QStackedWidget;
 
 namespace net {
 
@@ -36,21 +36,21 @@ class AppActivityPanel : public QFrame
 {
     Q_OBJECT
 
-    // The height the panel is currently animating to.
-    //
-    // Exposed as a property so QPropertyAnimation can drive it, but implemented to
-    // set minimum AND maximum together: that pins the panel's box and stops the
-    // parent layout from re-flowing every card on every frame, which is what made
-    // the reveal feel like the page was being pushed. -1 means "no constraint".
+    // Animate the clipping viewport while its content keeps its natural height.
     Q_PROPERTY(int animHeight READ animHeight WRITE setAnimHeight)
 
 public:
     explicit AppActivityPanel(AppMonitor *monitor, QWidget *parent = nullptr);
+    ~AppActivityPanel() override;
+
+    QSize sizeHint() const override;
+    QSize minimumSizeHint() const override;
 
     int animHeight() const { return m_animHeight; }
     void setAnimHeight(int height);
 
     bool isExpanded() const { return m_expanded; }
+    bool isAnimating() const { return m_animating; }
     void setExpanded(bool expanded);
 
     // Drives the panel from the monitor. Called once per monitor interval while
@@ -67,29 +67,27 @@ public:
     bool sortDescending() const { return m_sortDescending; }
 
     // Expand/collapse tween. On by default for the app; the offscreen suites
-    // turn it off so visibility assertions never have to race a 160ms tween.
+    // turn it off for immediate visibility assertions.
     void setAnimated(bool animated) { m_animated = animated; }
     bool isAnimated() const { return m_animated; }
 
 signals:
     void expandedChanged(bool expanded);
+    void revealStarted(int fromHeight, int toHeight);
 
-    // Emitted once the reveal or collapse tween has run to completion - NOT when
-    // it is interrupted by a new toggle. The dashboard uses this to decide
-    // whether (and by how little) to glide the viewport, because only a finished
-    // tween leaves the scroll range in its final state.
-    // Emitted on every animated height change while the reveal or collapse runs.
-    // The dashboard follows the growing bottom edge with the viewport in the SAME
-    // frames as the growth, which reads as one continuous motion; the previous
-    // unroll-then-glide sequence made the top row dip and spring back.
+    // Current clip height, followed by notification when a transition settles.
     void revealTick(int height);
 
     void revealFinished();
 
 private:
-    // Rebuilds the opacity effect after the widget has been re-parented,
-    // which destroys the previous one. Also re-points the fade animation,
-    // which would otherwise hold a dead target.
+    int contentHeight() const;
+    void layoutContent();
+    void animateToHeight(int target);
+    void advanceReveal();
+    void finishReveal();
+    void beginPreciseTiming();
+    void endPreciseTiming();
 
     // Sizes the three numeric columns to the widest string they can display and
     // lets the name column take the rest. Re-run on font or theme changes.
@@ -116,17 +114,12 @@ private:
     // Guards applyNumericColumnWidths against re-entering from the layout pass it causes.
     bool m_adjustingColumns = false;
 
-    // Applies the visibility rules for the current state (error / empty / rows) so
-    // that a following sizeHint() reports the height of what will actually be shown.
-    // A hidden child still counts toward its layout's size hint, which is why the
-    // reveal target used to overshoot by the whole table.
-    void updateStateVisibility();
-
     void rebuildTable();
-    void updateEmptyStates();
-    void onHeaderClicked(int column);
 
     AppMonitor *m_monitor = nullptr;
+    QWidget *m_content = nullptr;
+    QStackedWidget *m_states = nullptr;
+    int m_contentHeight = 240;
     bool m_expanded = false;
     bool m_showAll = false;
     bool m_hasData = false;
@@ -156,28 +149,21 @@ private:
     QLabel *m_scopeNoteLabel = nullptr;
     BusyDots *m_busyDots = nullptr;   // animated wait indicator
 
-    // Set when a collapse wants the trace session released, but the
-    // collapse animation is still running. The stop then happens once the
-    // animation finishes: stopping mid-animation blocked the UI thread
-    // against the very widgets being animated, which crashed the app.
-    bool m_stopMonitorWhenCollapsed = false;   // shown when measuring TCP only
+    QTimer *m_revealTimer = nullptr;
+    QElapsedTimer m_revealClock;
+    qreal m_revealTimeMs = 0;
+    int m_revealDurationMs = 360;
+    int m_revealFrom = 0;
+    int m_revealTo = 0;
+    int m_revealDirection = 1;
 
-    // Expand/collapse tween state.
-    // The reveal/collapse tween. A single property animation on animHeight:
-    // the parallel height+opacity group that preceded it invalidated the whole
-    // dashboard layout every frame and forced an offscreen render, which is
-    // what made the motion feel like a shove and stutter.
-    QPropertyAnimation *m_expandAnim = nullptr;
-    // The reveal-only opacity effect. Lives exactly as long as the tween:
-    // destroyed when the fade completes so no offscreen render cost survives it.
+    // Keep a zero-height layout slot when collapsed so spacing never snaps.
+    int m_animHeight = 0;
 
-    // Current tween height, -1 when unconstrained.
-    int m_animHeight = -1;
-
-    // True while a reveal or collapse is in flight; the table rebuild is
-    // skipped during this so frames are not spent rebuilding rows.
+    // The same live children paint throughout; only their clipping frame moves.
+    // Defer data/layout changes until the transition settles.
     bool m_animating = false;
-    int m_maxHeight = QWIDGETSIZE_MAX;
+    bool m_preciseTiming = false;
     bool m_animated = true;
 
     static constexpr int kTopCount = 5;

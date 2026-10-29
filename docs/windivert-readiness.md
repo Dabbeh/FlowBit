@@ -1,5 +1,9 @@
 # The WinDivert driver: when it is installed, and why it is not ready immediately
 
+> Correction (2026-10-23): the service is temporary and recreated on demand. Its
+> absence or pending deletion alone does not establish an installation problem.
+> See [the service lifecycle correction](windivert-service-lifecycle.md).
+
 ## What the driver is
 
 WinDivert is the kernel component that lets Flowbit hold a packet back and release it at a
