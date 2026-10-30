@@ -1,6 +1,6 @@
 {
-  "notes": "A clearer download window with progress, speed and time remaining. New updates are offered automatically on startup and every 30 minutes while Flowbit is running.",
-  "sha256": "cced1f58a6fd1f1de123096b45350c7d94e75697c338f67c3e49c4b4543576e3",
-  "url": "https://github.com/Dabbeh/FlowBit/releases/download/v1.0.3/Flowbit.exe",
-  "version": "1.0.3"
+  "version": "1.0.4",
+  "notes": "App Limiter cards now show saved schedule limits even outside their hours, matching the Schedule dialog. Applications without schedules show their original limits.",
+  "url": "https://github.com/Dabbeh/FlowBit/releases/download/v1.0.4/Flowbit.exe",
+  "sha256": "fb8b822c98cbb7de6518035c5d7d4f8b4d3ccb89cdc9f4f6acdd28b23911f9ad"
 }

@@ -47,13 +47,16 @@ int main(int argc, char **argv)
     QNetworkRequest request{QUrl(download)};
     request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                          QNetworkRequest::NoLessSafeRedirectPolicy);
+    request.setTransferTimeout(30000); // Match the app's inactivity timeout.
     auto *reply = network.get(request);
     QCryptographicHash hash(QCryptographicHash::Sha256);
     qint64 bytes = 0;
     auto consume = [&] { const auto chunk = reply->readAll(); bytes += chunk.size(); hash.addData(chunk); };
     QObject::connect(reply, &QNetworkReply::readyRead, consume);
     QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    timeout.start(60000);
+    // A slow but progressing download is valid. Bound the whole test separately
+    // from the request's inactivity timeout rather than failing after one minute.
+    timeout.start(10 * 60 * 1000);
     loop.exec();
     timeout.stop();
     consume();
@@ -61,6 +64,9 @@ int main(int argc, char **argv)
         && hash.result().toHex() == QByteArray(argv[3]).toLower();
     std::printf("%s: Qt downloads %lld bytes matching the release SHA-256\n",
                 ok ? "PASS" : "FAIL", static_cast<long long>(bytes));
+    if (!ok)
+        std::printf("  network: %s; test deadline exceeded: %s\n",
+                    qPrintable(reply->errorString()), failed ? "yes" : "no");
     delete reply;
     return ok ? 0 : 1;
 }
