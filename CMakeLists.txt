@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.19)
 
 project(Flowbit
-    VERSION 1.0.3
+    VERSION 1.0.4
     DESCRIPTION "System-wide and per-application bandwidth limiter with schedules, live monitoring and diagnostics"
     LANGUAGES CXX RC)
 

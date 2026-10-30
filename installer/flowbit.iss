@@ -34,7 +34,7 @@
 ; need administrative rights, which is what this installer requests.
 
 #define AppName "Flowbit"
-#define AppVersion "1.0.3"
+#define AppVersion "1.0.4"
 #define AppPublisher "Flowbit"
 #define AppExeName "Flowbit.exe"
 

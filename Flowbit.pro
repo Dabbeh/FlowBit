@@ -14,7 +14,7 @@ CONFIG += c++17 windows
 CONFIG -= console
 TEMPLATE = app
 TARGET = Flowbit
-VERSION = 1.0.3
+VERSION = 1.0.4
 
 # Per-configuration output dirs, mirroring the layout used by the scripts.
 CONFIG(debug, debug|release) {

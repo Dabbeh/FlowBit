@@ -18,12 +18,12 @@ namespace {
 // "22:00 -> 07:00, Weekdays" - short enough for a card, complete enough to be
 // trustworthy. Reuses the scheduler's own description logic so the wording matches
 // the Scheduler page exactly.
-QString windowSummary(const QVector<Rule> &windows)
+QString windowSummary(const QVector<Rule> &windows, int index)
 {
     if (windows.isEmpty())
         return QStringLiteral("Always on");
 
-    const Rule &w = windows.first();
+    const Rule &w = windows.at(index);
     QString s = QStringLiteral("%1 \u2192 %2").arg(w.from, w.to);
     if (w.days == 0x7F)
         s += QStringLiteral(", every day");
@@ -178,11 +178,31 @@ void AppLimitCard::rebuild()
     if (m_icon)
         m_icon->setToolTip(m_rule.path.isEmpty() ? m_rule.exe : m_rule.path);
 
-    // A schedule window may carry its own limits, so while one is in force the card shows
-    // what is actually being applied rather than the application's base rates. With nothing
-    // active it shows the base rates, which is what will apply once a window opens.
-    const RateBps shownDown = m_state.active ? m_state.down : m_rule.down;
-    const RateBps shownUp = m_state.active ? m_state.up : m_rule.up;
+    // This card describes the configured limits, including outside scheduled
+    // hours. Prefer the active window; otherwise preview the first enabled
+    // window (or the first saved window if all are disabled). Keep its hours
+    // and rates together so multiple windows cannot produce a mismatched card.
+    int shownWindow = m_state.matchedWindow;
+    if (shownWindow < 0 || shownWindow >= m_rule.windows.size()) {
+        shownWindow = m_rule.windows.isEmpty() ? -1 : 0;
+        for (int i = 0; i < m_rule.windows.size(); ++i) {
+            if (m_rule.windows.at(i).enabled) {
+                shownWindow = i;
+                break;
+            }
+        }
+    }
+    RateBps shownDown = m_rule.down;
+    RateBps shownUp = m_rule.up;
+    if (shownWindow >= 0) {
+        const Rule &window = m_rule.windows.at(shownWindow);
+        if (window.down != kUnlimited) shownDown = window.down;
+        if (window.up != kUnlimited) shownUp = window.up;
+    }
+    if (m_state.active) {
+        shownDown = m_state.down;
+        shownUp = m_state.up;
+    }
 
     if (m_downValue)
         m_downValue->setText(limitText(shownDown));
@@ -197,7 +217,12 @@ void AppLimitCard::rebuild()
     }
 
     if (m_scheduleSummary)
-        m_scheduleSummary->setText(windowSummary(m_rule.windows));
+        m_scheduleSummary->setText(windowSummary(m_rule.windows, shownWindow));
+    const QString source = shownWindow < 0
+        ? QStringLiteral("Original application limits")
+        : QStringLiteral("Configured schedule limits. The status above shows whether they are currently active.");
+    m_downValue->setToolTip(source);
+    m_upValue->setToolTip(source);
 
     if (m_status) {
         // The status distinguishes three genuinely different situations, so a user
